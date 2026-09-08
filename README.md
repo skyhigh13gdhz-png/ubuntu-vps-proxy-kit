@@ -1,82 +1,62 @@
 # Ubuntu VPS Proxy Kit
 
-面向小白的 Ubuntu VPS 初始化、网络诊断与 Xray/3x-ui 部署辅助工具。
+面向小白的 Ubuntu VPS 代理搭建与排障工具。目标：拿到一台全新的 Ubuntu VPS 后，用尽可能少的人工操作完成环境检测、依赖安装、3X-UI/Xray、VLESS + REALITY、Unbound DNS、客户端参数整理和最终健康检查。
 
-> 目标：拿到一台全新的 Ubuntu VPS 后，尽量把重复的人肉检查、依赖安装、环境准备和故障信息采集自动化。项目不绑定 VPS 国家/地区或供应商。
+> 当前 v1.0 目标系统：Ubuntu 22.04 / 24.04 LTS。VPS 地区不限。
 
-## V1 设计原则
+## 设计原则
 
-1. **先诊断，后安装**：先判断 VPS 本身是否值得继续折腾，避免把线路/IP 问题误判成 Xray 配置问题。
-2. **Ubuntu 优先**：V1 默认支持 Ubuntu 20.04 / 22.04 / 24.04。
-3. **缺什么自动补什么**：curl、wget、openssl、socat、jq 等基础依赖缺失时自动安装。
-4. **安装与诊断分离**：`diagnose.sh` 只检查，不擅自改系统；`install.sh` 才负责安装。
-5. **不假装服务端能证明大陆可达**：VPS 自己 ping/HTTP 出站正常，只能证明 VPS 出站正常，不能证明中国大陆客户端 -> VPS 的入站路径正常。
-6. **失败必须可解释**：提供 `collect-report.sh` 生成脱敏诊断报告，方便后续排查和沉淀 FAQ。
-7. **幂等优先**：脚本重复运行时尽量不破坏已经存在的配置。
-
-## 推荐流程
-
-```text
-全新 Ubuntu VPS
-      ↓
-01 diagnose.sh
-      ↓
-判断系统 / IP / DNS / 出站 / 端口 / 防火墙 / Xray / 3x-ui 状态
-      ↓
-02 install.sh
-      ↓
-安装基础依赖 + 3x-ui/Xray
-      ↓
-在 3x-ui 中创建 VLESS + Reality 入站
-      ↓
-03 verify.sh
-      ↓
-检查进程、监听端口、配置与 VPS 出站
-      ↓
-客户端导入节点并实测
-      ↓
-有问题 → 04 collect-report.sh
-```
+- 能检测的自动检测，缺少普通工具时自动安装。
+- 重复执行尽量幂等，不无脑覆盖已有环境。
+- 修改重要配置前备份；验证失败时尽量回滚。
+- 不默认修改 SSH、默认路由、MTU、rp_filter、TSO/GSO/GRO、IPv6 等底层网络设置。
+- 大陆手机反向 TCP 测试不作为正常安装必经步骤，只在节点连不上时进入 Advanced Diagnostics。
+- Reality 的 target/SNI 不写死，避免把某个历史配置机械复制到所有 VPS。
 
 ## 快速开始
 
 ```bash
 sudo -i
-apt update && apt install -y git
 git clone https://github.com/skyhigh13gdhz-png/ubuntu-vps-proxy-kit.git
 cd ubuntu-vps-proxy-kit
-chmod +x scripts/*.sh
-./scripts/diagnose.sh
-./scripts/install.sh
-./scripts/verify.sh
+chmod +x setup.sh scripts/*.sh
+./setup.sh
 ```
 
-## 为什么不能完全自动检测“中国大陆直连可用性”？
+正常新机选择 `1. New VPS Setup`。
 
-VPS 位于链路的一端。它可以检查自己的公网 IP、监听端口、防火墙、Xray 状态和互联网出站，但不能仅靠自己证明“中国大陆某运营商当前能否连接这个 IP:端口”。
+## 推荐主流程
 
-因此 V1 把检测分成两层：
+1. Bootstrap：检查并补齐 curl、dig、traceroute、tcpdump、nc、ethtool、qrencode 等依赖。
+2. Pre-check：检查公网 IP、路由、DNS、时间同步、端口、防火墙、已有 Xray/3X-UI/Unbound。
+3. 安装 3X-UI：调用官方 MHSanaei/3x-ui 安装脚本，不静默覆盖已有代理栈。
+4. 在 3X-UI 创建 VLESS + REALITY 入站：默认 TCP/RAW 443、Flow=None、uTLS=chrome；target/SNI 需根据当前环境选择。
+5. Setup Unbound：先验证本机递归，再把 `/etc/resolv.conf` 切到 `127.0.0.1`；失败自动恢复。
+6. Health Check：检查 x-ui、443、Unbound、DNS、遗留 nc/tcpdump 和 offload 状态。
+7. 生成客户端参数：运行 `scripts/04_generate_client_notes.sh`，输出 VLESS URI 和终端二维码。
 
-- **服务端自动检测**：系统、网络、端口、服务、配置、出站等。
-- **客户端最终验证**：真实客户端导入节点后连接。只有这一层能验证具体客户端到 VPS 的实际路径。
+## 重要说明
 
-不强制用户额外做临时网页/手机访问测试；那类测试保留为故障排查的可选手段。
+3X-UI 官方当前推荐的一键安装方式为：
 
-## 文档
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
+```
 
-- `docs/DESIGN.md`：项目设计与边界
-- `docs/INSTALL.md`：从零部署教程
-- `docs/TROUBLESHOOTING.md`：排障与 FAQ
-- `docs/SECURITY.md`：安全注意事项
+本项目的安装脚本只是对官方安装器做前置检查和结果验证，不自行维护 3X-UI 二进制分发。
 
-## 脚本
+## 项目文档
 
-- `scripts/common.sh`：公共函数
-- `scripts/diagnose.sh`：安装前诊断
-- `scripts/install.sh`：依赖及 3x-ui/Xray 安装
-- `scripts/verify.sh`：安装后验证
-- `scripts/collect-report.sh`：生成脱敏报告
+- `docs/BEGINNER-GUIDE.md`：从零开始保姆教程
+- `docs/ARCHITECTURE.md`：架构与自动化边界
+- `docs/DESIGN-DECISIONS.md`：关键设计决策及原因
+- `docs/HISTORY-LESSONS.md`：真实排障案例与踩坑记录
+- `docs/TROUBLESHOOTING.md`：FAQ / 故障树
+- `docs/ROADMAP.md`：后续版本计划
 
-## 当前边界
+## 安全提醒
 
-V1 不尝试自动选择“最优线路”，也不承诺任何 VPS 从任何地区/运营商都可直连。线路质量、跨境路由、IP 状态和运营商策略都可能变化。项目首先解决的是：**把服务器端可自动化的工作自动化，把不可由服务器单方面证明的事情明确留给客户端验证。**
+- 不要把 Reality 私钥截图公开。
+- 面板长期不建议直接暴露公网；优先使用 SSH Tunnel 管理。
+- 本项目不会自动修改 SSH 登录策略。
+- 服务商 Cloud Firewall / Security Group 不属于 Ubuntu 本机防火墙，外部端口不通时必须一并检查。

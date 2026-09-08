@@ -1,4 +1,8 @@
-*.log
-vps-report-*.txt
-.env
+logs/*
+backups/*
+reports/*
+!logs/.gitkeep
+!backups/.gitkeep
+!reports/.gitkeep
+*.swp
 .DS_Store

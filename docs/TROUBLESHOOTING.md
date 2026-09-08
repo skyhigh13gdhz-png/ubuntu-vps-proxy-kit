@@ -1,61 +1,50 @@
-# 排障与 FAQ
+# Troubleshooting / FAQ
 
-## 1. VPS 能访问 Google，但客户端节点不能用
+## 1. 节点完全连不上，先查什么？
 
-这不矛盾。
-
-`VPS -> Google` 是服务器出站；客户端使用节点至少还涉及 `客户端 -> VPS -> 目标网站`。前半段被阻断、端口未开放、服务没监听或节点参数不匹配时，VPS 自己 curl Google 仍然可能完全正常。
-
-排查顺序：
-
-1. `systemctl status x-ui`
-2. `ss -lntp`
-3. 检查 VPS/供应商安全组/防火墙
-4. 核对客户端与服务端 VLESS/Reality 参数
-5. 再做真实客户端连接测试
-
-## 2. ping 不通是否代表节点不能用？
-
-不是。ICMP 和 TCP/UDP 是不同协议，供应商、防火墙或路径可能单独限制 ICMP。
-
-## 3. ping 通是否代表节点一定能用？
-
-也不是。它只能证明 ICMP 在测试时刻可达，不能证明代理端口、Reality 握手和应用层配置正确。
-
-## 4. curl 出现 `000`
-
-`000` 不是 HTTP 状态码，而是 curl 没拿到有效 HTTP 响应。需要结合 verbose 输出判断 DNS、TCP、TLS、超时还是代理环境问题。
-
-先执行：
+先运行：
 
 ```bash
-curl -4v --max-time 10 https://www.google.com/ -o /dev/null
+sudo ./setup.sh
+# 选择 Advanced diagnostics
 ```
 
-如果 verbose 中看到 TCP connected、TLS handshake 成功、证书验证成功以及 HTTP 200，说明这一次 VPS 到 Google 的 HTTPS 链路正常。
+判断顺序：
 
-## 5. 为什么不默认让手机访问临时测试网页？
+1. 443 是否监听；
+2. Ubuntu 本机 firewall 是否阻断；
+3. 云厂商 Security Group / Cloud Firewall；
+4. Reality 参数是否匹配；
+5. 必要时做 Mainland TCP Verification。
 
-临时 listener + 大陆手机访问确实能直接测试某个 TCP 入站方向，但它不是零交互，而且会增加小白流程复杂度。默认流程直接以真实代理客户端作为最终验证；只有需要进一步区分“端口链路问题”和“代理协议配置问题”时，才值得启用临时 listener。
+## 2. tcpdump 看到 SYN 和 SYN-ACK，但没有 ACK
 
-## 6. Speedtest 速度不错，为什么实际体验仍不好？
+这是重要信号。服务端已经收到客户端 SYN，也已经把 SYN-ACK 发出；如果客户端始终不完成握手，问题可能在 VPS 之外的路径、IP/网段过滤或云厂商网络层。不要第一时间改 MTU、rp_filter、offload。
 
-单次 Speedtest 不能代表跨境链路长期质量。除了带宽，还要看延迟、抖动、丢包、拥塞时段、回程/去程路径以及具体目标站点。
+## 3. `ping` 不通是不是节点坏了？
 
-## 7. 3x-ui 已经存在，为什么 install.sh 不继续？
+不是。ICMP 与 TCP 443 不是一回事，很多运营商/终端不回复 ICMP。应以 TCP/HTTPS 实测为准。
 
-这是保护机制。自动覆盖已有面板可能破坏现有节点、端口和数据库。先运行 `diagnose.sh` / `collect-report.sh`，确认环境后再决定升级或重装。
+## 4. Whoer DNS 显示奇怪国家怎么办？
 
-## 8. Reality 应该照抄教程中的 target/SNI 吗？
+先检查：
 
-不应该。示例只能说明字段含义。目标站点的可达性和 TLS 特征会变化，应从 VPS 当前网络环境验证。
+```bash
+cat /etc/resolv.conf
+systemctl status unbound --no-pager
+dig @127.0.0.1 example.com
+```
 
-## 9. 什么时候怀疑是 VPS/IP/线路，而不是配置？
+如果 resolv.conf 被改回 8.8.8.8/8.8.4.4，可运行 `scripts/03_setup_unbound.sh` 修复。
 
-当服务正常运行、端口确实监听、服务端配置和客户端参数一致，但多个真实网络仍无法建立到该端口的连接时，应把注意力转向安全组、供应商网络、IP 状态和跨境路径，而不是无限修改 Xray 参数。
+## 5. Mac `dig` 显示 198.18.0.x 是 DNS 泄漏吗？
 
-## 10. 排障时最容易犯的错误
+通常不是。Shadowrocket Fake-IP/TUN 会使用 `198.18.0.0/15` 保留地址接管 DNS/连接。需要结合 VPS 端 Unbound 和抓包判断真实上游。
 
-一次改多个变量。比如同时换端口、SNI、Reality 参数、客户端和路由，然后即使恢复也不知道究竟是什么导致的。
+## 6. 3X-UI 面板要不要直接暴露公网？
 
-正确方法是一次只改一个变量，并保留修改前后的结果。
+不建议长期暴露。优先通过 SSH Tunnel 访问管理面板。不要让本项目自动修改 SSH 安全策略；先保证救援通道可靠。
+
+## 7. 为什么不自动修改 rp_filter / TSO / GSO / GRO？
+
+因为这些属于底层网络调优项，不应该成为“小白安装”的默认动作。历史案例中即使把它们改掉，真正的 IP 可达性问题也不会消失。
