@@ -199,7 +199,6 @@ remove_old_sensitive_backups() {
 
 make_config() {
   mkdir -p "$(dirname "$XRAY_CONFIG")"
-  # Older script versions created credential-bearing backups. Do not retain them.
   remove_old_sensitive_backups
 
   VLESS_URI="$VLESS_URI" python3 - "$XRAY_CONFIG" <<'PY'
@@ -328,6 +327,16 @@ proxy_off() {
   unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy NO_PROXY no_proxy
   echo "Proxy variables cleared for this shell."
 }
+# Recommended when this VPS is about to be returned/transferred.
+# Because this is a shell function, it can clear the current Bash history buffer
+# before the manager removes persistent files and credentials.
+xray_return_cleanup() {
+  if [[ -n "${BASH_VERSION:-}" ]]; then
+    history -c 2>/dev/null || true
+    history -w 2>/dev/null || true
+  fi
+  sudo xray-vless-manager uninstall --purge-history
+}
 EOF
   chmod 0644 "$XRAY_PROFILE"
 
@@ -384,6 +393,52 @@ remove_docker_proxy() {
   fi
 }
 
+scrub_vless_history_files() {
+  need_root
+  python3 - <<'PY'
+import os, pwd
+
+names = {'.bash_history', '.zsh_history', '.sh_history', '.ash_history'}
+homes = {'/root'}
+for p in pwd.getpwall():
+    home = p.pw_dir
+    if home and home.startswith('/') and os.path.isdir(home):
+        homes.add(home)
+
+changed = 0
+removed = 0
+for home in sorted(homes):
+    for name in names:
+        path = os.path.join(home, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, 'rb') as f:
+                data = f.readlines()
+            kept = []
+            local_removed = 0
+            for line in data:
+                if b'vless://' in line.lower():
+                    local_removed += 1
+                else:
+                    kept.append(line)
+            if local_removed:
+                st = os.stat(path)
+                with open(path, 'wb') as f:
+                    f.writelines(kept)
+                os.chmod(path, st.st_mode)
+                try:
+                    os.chown(path, st.st_uid, st.st_gid)
+                except PermissionError:
+                    pass
+                changed += 1
+                removed += local_removed
+        except OSError as e:
+            print(f'Warning: could not scrub {path}: {e}')
+print(f'Shell history scrub: removed {removed} VLESS-containing line(s) from {changed} file(s).')
+PY
+}
+
 case "${1:-help}" in
   status)
     echo "Xray service:  $(systemctl is-active xray 2>/dev/null || true)"
@@ -406,11 +461,17 @@ case "${1:-help}" in
     echo "Node configuration removed and Xray stopped."
     echo "If proxy_on was used in this shell, run: proxy_off"
     ;;
+  purge-history)
+    scrub_vless_history_files
+    ;;
   uninstall)
     need_root
     systemctl disable --now xray 2>/dev/null || true
     remove_config_files
     remove_docker_proxy
+    if [[ "${2:-}" == "--purge-history" ]]; then
+      scrub_vless_history_files
+    fi
     rm -f /etc/systemd/system/xray.service
     rm -f /usr/local/bin/xray /usr/local/bin/xray-proxy-test
     rm -f /etc/profile.d/xray-proxy.sh
@@ -418,17 +479,28 @@ case "${1:-help}" in
     systemctl daemon-reload
     rm -f /usr/local/bin/xray-vless-manager
     echo "Xray, node credentials, proxy helpers and Docker proxy configuration removed."
-    echo "Existing shell proxy variables cannot be changed by a child process; reconnect or run proxy_off before uninstalling."
+    if [[ "${2:-}" == "--purge-history" ]]; then
+      echo "Persistent shell-history files were also scrubbed for lines containing vless://."
+      echo "For Bash, xray_return_cleanup is preferred because it also clears the current shell's in-memory history before uninstall."
+    else
+      echo "History was NOT scrubbed. For server return/transfer, use xray_return_cleanup or uninstall --purge-history."
+    fi
     ;;
   help|-h|--help)
     cat <<'HELP'
 Xray VLESS manager
 
-  xray-vless-manager status       Show current state
-  xray-vless-manager test         Test Google/GitHub/proxy exit
-  sudo xray-vless-manager set-node     Replace/add VLESS node (hidden input)
-  sudo xray-vless-manager remove-node  Remove personal node config, keep Xray installed
-  sudo xray-vless-manager uninstall    Remove Xray and all local configuration
+  xray-vless-manager status                 Show current state
+  xray-vless-manager test                   Test Google/GitHub/proxy exit
+  sudo xray-vless-manager set-node          Replace/add VLESS node (hidden input)
+  sudo xray-vless-manager remove-node       Remove personal node config, keep Xray installed
+  sudo xray-vless-manager purge-history     Remove vless:// lines from persisted shell histories
+  sudo xray-vless-manager uninstall         Remove Xray/config but keep shell history untouched
+  sudo xray-vless-manager uninstall --purge-history
+                                             Also scrub persisted VLESS history lines
+
+Recommended before returning/transferring a Bash-managed VPS:
+  xray_return_cleanup
 
 Shell proxy switch:
   proxy_on
@@ -514,4 +586,4 @@ echo "  xray-vless-manager test"
 echo "  proxy_on / proxy_off"
 echo "  sudo xray-vless-manager set-node"
 echo "  sudo xray-vless-manager remove-node"
-echo "  sudo xray-vless-manager uninstall"
+echo "  xray_return_cleanup   # recommended before returning/transferring this VPS"
