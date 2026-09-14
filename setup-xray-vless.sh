@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Tencent/China VPS -> Xray client -> VLESS Malaysia node
+# China VPS -> local Xray client -> overseas VLESS node
 # Usage:
 #   sudo bash setup-xray-vless.sh
 # Then paste the VLESS URI when prompted; input is hidden and is not stored in shell history.
 #
-# Default routing:
+# Xray routing:
 #   private + CN -> DIRECT
-#   everything else -> Malaysia VLESS
+#   everything else -> VLESS
 #
 # Local proxy:
 #   SOCKS5: 127.0.0.1:10808
@@ -20,7 +20,7 @@ XRAY_ASSET_DIR="/usr/local/share/xray"
 XRAY_TMP_DIR="/tmp/xray-bootstrap"
 
 # Mainland-first binary mirror. Each Xray version is stored as a branch in Gitee.
-# Override at runtime if needed, for example:
+# Override at runtime if needed:
 #   XRAY_VERSION=v26.3.27 sudo -E bash setup-xray-vless.sh
 XRAY_VERSION="${XRAY_VERSION:-v26.3.27}"
 XRAY_GITEE_REPO="https://gitee.com/skyhigh13/xray_bin.git"
@@ -93,6 +93,21 @@ download_xray_from_gitee() {
   fi
 
   cp -f "${clone_dir}/${asset}" "$output"
+
+  # Prefer the mirrored digest when available. Xray .dgst files contain the
+  # official SHA2-256 value. ZIP integrity is still checked afterwards.
+  if [[ -f "${clone_dir}/${asset}.dgst" ]]; then
+    local expected actual
+    expected="$(awk -F '= ' '/256=/{print $2; exit}' "${clone_dir}/${asset}.dgst" | tr -d '[:space:]')"
+    actual="$(sha256sum "$output" | awk '{print $1}')"
+    if [[ -n "$expected" && "$expected" != "$actual" ]]; then
+      info "Gitee SHA256 verification failed."
+      rm -rf "$clone_dir" "$output"
+      return 1
+    fi
+    [[ -n "$expected" ]] && info "SHA256 verification passed."
+  fi
+
   rm -rf "$clone_dir"
 
   unzip -tq "$output" >/dev/null || {
@@ -215,7 +230,6 @@ if not uuid or not host or not port:
     raise SystemExit("VLESS URI is missing UUID, host, or port")
 
 q = {k: v[-1] for k, v in parse_qs(u.query, keep_blank_values=True).items()}
-
 network = (q.get("type") or "tcp").lower()
 security = (q.get("security") or "none").lower()
 flow = q.get("flow") or ""
@@ -225,143 +239,78 @@ user = {"id": uuid, "encryption": encryption}
 if flow:
     user["flow"] = flow
 
-stream = {
-    "network": network,
-    "security": security,
-}
+stream = {"network": network, "security": security}
 
-# TLS
 if security == "tls":
     tls = {}
     sni = q.get("sni") or q.get("serverName")
-    if sni:
-        tls["serverName"] = sni
+    if sni: tls["serverName"] = sni
     fp = q.get("fp")
-    if fp:
-        tls["fingerprint"] = fp
+    if fp: tls["fingerprint"] = fp
     alpn = q.get("alpn")
-    if alpn:
-        tls["alpn"] = [x for x in alpn.split(",") if x]
+    if alpn: tls["alpn"] = [x for x in alpn.split(",") if x]
     if (q.get("allowInsecure") or "").lower() in ("1", "true", "yes"):
         tls["allowInsecure"] = True
     stream["tlsSettings"] = tls
-
-# REALITY
 elif security == "reality":
     reality = {}
     sni = q.get("sni") or q.get("serverName")
-    if sni:
-        reality["serverName"] = sni
+    if sni: reality["serverName"] = sni
     fp = q.get("fp")
-    if fp:
-        reality["fingerprint"] = fp
+    if fp: reality["fingerprint"] = fp
     pbk = q.get("pbk") or q.get("publicKey")
-    if pbk:
-        reality["publicKey"] = pbk
+    if pbk: reality["publicKey"] = pbk
     sid = q.get("sid") or q.get("shortId")
-    if sid:
-        reality["shortId"] = sid
+    if sid: reality["shortId"] = sid
     spx = q.get("spx") or q.get("spiderX")
-    if spx:
-        reality["spiderX"] = spx
+    if spx: reality["spiderX"] = spx
     stream["realitySettings"] = reality
 
-# Transport
 if network == "ws":
     ws = {}
     path = q.get("path")
-    if path:
-        ws["path"] = path
+    if path: ws["path"] = path
     host_hdr = q.get("host")
-    if host_hdr:
-        ws["headers"] = {"Host": host_hdr}
+    if host_hdr: ws["headers"] = {"Host": host_hdr}
     stream["wsSettings"] = ws
-
 elif network == "grpc":
     grpc = {}
     service = q.get("serviceName") or q.get("path")
-    if service:
-        grpc["serviceName"] = service
+    if service: grpc["serviceName"] = service
     authority = q.get("authority")
-    if authority:
-        grpc["authority"] = authority
-    if (q.get("mode") or "").lower() == "multi":
-        grpc["multiMode"] = True
+    if authority: grpc["authority"] = authority
+    if (q.get("mode") or "").lower() == "multi": grpc["multiMode"] = True
     stream["grpcSettings"] = grpc
-
 elif network == "xhttp":
     xh = {}
     path = q.get("path")
-    if path:
-        xh["path"] = path
+    if path: xh["path"] = path
     host_hdr = q.get("host")
-    if host_hdr:
-        xh["host"] = host_hdr
+    if host_hdr: xh["host"] = host_hdr
     mode = q.get("mode")
-    if mode:
-        xh["mode"] = mode
+    if mode: xh["mode"] = mode
     stream["xhttpSettings"] = xh
 
-elif network == "tcp":
-    pass
-
 config = {
-    "log": {
-        "loglevel": "warning"
-    },
+    "log": {"loglevel": "warning"},
     "inbounds": [
-        {
-            "tag": "socks-local",
-            "listen": "127.0.0.1",
-            "port": 10808,
-            "protocol": "socks",
-            "settings": {
-                "udp": True
-            }
-        },
-        {
-            "tag": "http-local",
-            "listen": "127.0.0.1",
-            "port": 10809,
-            "protocol": "http",
-            "settings": {}
-        }
+        {"tag": "socks-local", "listen": "127.0.0.1", "port": 10808,
+         "protocol": "socks", "settings": {"udp": True}},
+        {"tag": "http-local", "listen": "127.0.0.1", "port": 10809,
+         "protocol": "http", "settings": {}}
     ],
     "outbounds": [
-        {
-            "tag": "malaysia",
-            "protocol": "vless",
-            "settings": {
-                "vnext": [{
-                    "address": host,
-                    "port": port,
-                    "users": [user]
-                }]
-            },
-            "streamSettings": stream
-        },
-        {
-            "tag": "direct",
-            "protocol": "freedom"
-        },
-        {
-            "tag": "block",
-            "protocol": "blackhole"
-        }
+        {"tag": "malaysia", "protocol": "vless",
+         "settings": {"vnext": [{"address": host, "port": port, "users": [user]}]},
+         "streamSettings": stream},
+        {"tag": "direct", "protocol": "freedom"},
+        {"tag": "block", "protocol": "blackhole"}
     ],
     "routing": {
         "domainStrategy": "IPIfNonMatch",
         "rules": [
-            {
-                "type": "field",
-                "ip": ["geoip:private", "geoip:cn"],
-                "outboundTag": "direct"
-            },
-            {
-                "type": "field",
-                "domain": ["geosite:cn"],
-                "outboundTag": "direct"
-            }
+            {"type": "field", "ip": ["geoip:private", "geoip:cn"], "outboundTag": "direct"},
+            {"type": "field", "domain": ["geosite:cn"], "outboundTag": "direct"}
         ]
     }
 }
@@ -373,6 +322,69 @@ print(f"Parsed VLESS: host={host}, port={port}, network={network}, security={sec
 PY
 
   chmod 600 "$XRAY_CONFIG"
+}
+
+install_proxy_helpers() {
+  # Do NOT force a machine-wide proxy. These helpers make proxy use explicit
+  # for interactive shell sessions while Xray itself still performs CN/direct
+  # versus overseas/VLESS routing.
+  cat >/etc/profile.d/xray-proxy.sh <<'EOF'
+# Xray local proxy helpers. Run `proxy_on` or `proxy_off` in an interactive shell.
+proxy_on() {
+  export http_proxy="http://127.0.0.1:10809"
+  export https_proxy="http://127.0.0.1:10809"
+  export HTTP_PROXY="$http_proxy"
+  export HTTPS_PROXY="$https_proxy"
+  export ALL_PROXY="socks5h://127.0.0.1:10808"
+  export all_proxy="$ALL_PROXY"
+  export NO_PROXY="localhost,127.0.0.1,::1"
+  export no_proxy="$NO_PROXY"
+  echo "Xray proxy enabled for this shell."
+}
+proxy_off() {
+  unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy NO_PROXY no_proxy
+  echo "Proxy variables cleared for this shell."
+}
+EOF
+  chmod 0644 /etc/profile.d/xray-proxy.sh
+
+  cat >/usr/local/bin/xray-proxy-test <<'EOF'
+#!/usr/bin/env bash
+set -u
+SOCKS="127.0.0.1:10808"
+HTTP="http://127.0.0.1:10809"
+printf 'Xray service: '
+systemctl is-active xray 2>/dev/null || true
+printf 'Google via SOCKS: '
+curl -o /dev/null -sS -w '%{http_code}\n' --max-time 20 --socks5-hostname "$SOCKS" https://www.google.com/ || true
+printf 'GitHub via HTTP:  '
+curl -o /dev/null -sS -w '%{http_code}\n' --max-time 20 -x "$HTTP" https://github.com/ || true
+printf 'Proxy exit IP:    '
+curl -fsS --max-time 20 --socks5-hostname "$SOCKS" https://api.ipify.org || true
+echo
+EOF
+  chmod 0755 /usr/local/bin/xray-proxy-test
+}
+
+configure_docker_proxy() {
+  # If Docker is already installed, configure only the Docker daemon's outbound
+  # HTTP(S) requests (image pulls, registry access) through local Xray.
+  # Containers themselves do not automatically inherit this proxy.
+  if ! command -v docker >/dev/null 2>&1; then
+    info "Docker not installed; skipping Docker daemon proxy configuration."
+    return
+  fi
+
+  info "Configuring Docker daemon to use local Xray HTTP proxy..."
+  mkdir -p /etc/systemd/system/docker.service.d
+  cat >/etc/systemd/system/docker.service.d/xray-proxy.conf <<'EOF'
+[Service]
+Environment="HTTP_PROXY=http://127.0.0.1:10809"
+Environment="HTTPS_PROXY=http://127.0.0.1:10809"
+Environment="NO_PROXY=localhost,127.0.0.1,::1"
+EOF
+  systemctl daemon-reload
+  systemctl restart docker
 }
 
 start_and_test() {
@@ -394,34 +406,44 @@ start_and_test() {
   echo "  SOCKS5  socks5h://127.0.0.1:10808"
   echo "  HTTP    http://127.0.0.1:10809"
   echo
-  echo "Routing:"
+  echo "Routing inside Xray:"
   echo "  Private/CN -> DIRECT"
-  echo "  Everything else -> Malaysia VLESS"
+  echo "  Everything else -> VLESS"
   echo
 
-  info "Testing direct public IP..."
-  DIRECT_IP="$(curl -4fsS --max-time 10 https://api.ipify.org || true)"
-  echo "  Direct IP: ${DIRECT_IP:-<failed>}"
-
-  info "Testing Malaysia proxy public IP..."
+  info "Testing proxy public IP..."
   PROXY_IP="$(curl -4fsS --max-time 20 --socks5-hostname 127.0.0.1:10808 https://api.ipify.org || true)"
-  echo "  Proxy IP:  ${PROXY_IP:-<failed>}"
+  echo "  Proxy IP: ${PROXY_IP:-<failed>}"
 
-  info "Testing GitHub through the Malaysia proxy..."
+  info "Testing GitHub through proxy..."
   GITHUB_STATUS="$(curl -o /dev/null -sS -w '%{http_code}' --max-time 20 --socks5-hostname 127.0.0.1:10808 https://github.com/ || true)"
-  echo "  GitHub HTTP status via proxy: ${GITHUB_STATUS:-<failed>}"
+  echo "  GitHub HTTP status: ${GITHUB_STATUS:-<failed>}"
 
-  if [[ -n "$PROXY_IP" && "$PROXY_IP" != "$DIRECT_IP" && "$GITHUB_STATUS" =~ ^(200|301|302)$ ]]; then
+  info "Testing Google through proxy..."
+  GOOGLE_STATUS="$(curl -o /dev/null -sS -w '%{http_code}' --max-time 20 --socks5-hostname 127.0.0.1:10808 https://www.google.com/ || true)"
+  echo "  Google HTTP status: ${GOOGLE_STATUS:-<failed>}"
+
+  if [[ -n "$PROXY_IP" && "$GITHUB_STATUS" =~ ^(200|301|302)$ && "$GOOGLE_STATUS" =~ ^(200|301|302)$ ]]; then
     echo
-    echo "SUCCESS: Malaysia proxy path and GitHub access are working."
+    echo "SUCCESS: Xray VLESS path, GitHub and Google access are working."
   else
     echo
-    echo "WARNING: proxy IP test did not clearly confirm a different egress IP or GitHub access failed."
+    echo "WARNING: one or more proxy checks failed."
     echo "Check: journalctl -u xray -n 100 --no-pager"
   fi
+
+  echo
+  echo "Shell helpers (open a new shell, or run: source /etc/profile.d/xray-proxy.sh):"
+  echo "  proxy_on            enable HTTP(S)/SOCKS proxy vars for current shell"
+  echo "  proxy_off           clear proxy vars for current shell"
+  echo "  xray-proxy-test     quick connectivity test"
+  echo
+  echo "Note: ping uses ICMP and does NOT go through this SOCKS/HTTP proxy."
 }
 
 install_deps
 install_xray
 make_config
+install_proxy_helpers
 start_and_test
+configure_docker_proxy
