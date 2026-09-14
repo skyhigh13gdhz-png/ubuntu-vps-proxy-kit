@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# China VPS -> local Xray client -> overseas VLESS node
-# Normal install/reconfigure:
-#   sudo bash setup-xray-vless.sh
-# Then paste the VLESS URI when prompted; input is hidden and is not stored in shell history.
+# Mainland VPS -> local Xray client -> overseas VLESS node.
+# Security rule: VLESS credentials are accepted only through hidden interactive input.
 
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_BIN="/usr/local/bin/xray"
@@ -13,8 +11,10 @@ XRAY_TMP_DIR="/tmp/xray-bootstrap"
 XRAY_LIBEXEC_DIR="/usr/local/libexec/xray-vless"
 XRAY_BOOTSTRAP="${XRAY_LIBEXEC_DIR}/setup-xray-vless.sh"
 XRAY_MANAGER="/usr/local/bin/xray-vless-manager"
+XRAY_TEST="/usr/local/bin/xray-proxy-test"
 XRAY_PROFILE="/etc/profile.d/xray-proxy.sh"
 DOCKER_PROXY_FILE="/etc/systemd/system/docker.service.d/xray-proxy.conf"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
 
 XRAY_VERSION="${XRAY_VERSION:-v26.3.27}"
 XRAY_GITEE_REPO="https://gitee.com/skyhigh13/xray_bin.git"
@@ -24,18 +24,19 @@ XRAY_MIRRORS=(
   "https://gh.ddlc.top/"
   "https://ghproxy.net/"
 )
+TOOLS_RAW_BASE="https://raw.githubusercontent.com/skyhigh13gdhz-png/ubuntu-vps-proxy-kit/mainland_vps_use_proxy"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "[+] $*"; }
 
 [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Please run as root (sudo)."
 
-if [[ $# -ge 1 ]]; then
-  VLESS_URI="$1"
-else
-  read -r -s -p "Paste VLESS URI: " VLESS_URI
-  echo
+if [[ $# -gt 0 ]]; then
+  die "For security, do not pass a VLESS URI on the command line. Run this script with no arguments and paste it into the hidden prompt."
 fi
+
+read -r -s -p "Paste VLESS URI: " VLESS_URI
+echo
 [[ "$VLESS_URI" == vless://* ]] || die "The VLESS URI must start with vless://"
 
 install_deps() {
@@ -66,20 +67,13 @@ download_xray_from_gitee() {
 
   info "Trying mainland Gitee binary mirror (${version})..."
   rm -rf "$clone_dir"
-
-  if ! git -c advice.detachedHead=false clone \
-      --quiet --depth 1 --single-branch --branch "$version" \
-      "$XRAY_GITEE_REPO" "$clone_dir"; then
+  if ! git -c advice.detachedHead=false clone --quiet --depth 1 --single-branch \
+      --branch "$version" "$XRAY_GITEE_REPO" "$clone_dir"; then
     rm -rf "$clone_dir"
     return 1
   fi
 
-  if [[ ! -f "${clone_dir}/${asset}" ]]; then
-    info "Gitee branch exists but ${asset} is missing."
-    rm -rf "$clone_dir"
-    return 1
-  fi
-
+  [[ -f "${clone_dir}/${asset}" ]] || { rm -rf "$clone_dir"; return 1; }
   cp -f "${clone_dir}/${asset}" "$output"
 
   if [[ -f "${clone_dir}/${asset}.dgst" ]]; then
@@ -95,12 +89,7 @@ download_xray_from_gitee() {
   fi
 
   rm -rf "$clone_dir"
-  unzip -tq "$output" >/dev/null || {
-    info "Gitee archive failed ZIP integrity check."
-    rm -f "$output"
-    return 1
-  }
-
+  unzip -tq "$output" >/dev/null || { rm -f "$output"; return 1; }
   info "Downloaded ${asset} from Gitee successfully."
 }
 
@@ -130,7 +119,6 @@ download_xray_fallback() {
       "$github_url" -o "$output"; then
     unzip -tq "$output" >/dev/null && return 0
   fi
-
   rm -f "$output"
   return 1
 }
@@ -141,18 +129,16 @@ install_xray() {
     return
   fi
 
-  local asset version zip_file
+  local asset zip_file
   asset="$(get_arch_asset)"
-  version="$XRAY_VERSION"
-
   rm -rf "$XRAY_TMP_DIR"
   mkdir -p "$XRAY_TMP_DIR"
   zip_file="${XRAY_TMP_DIR}/${asset}"
 
-  info "Installing Xray ${version} (${asset})..."
-  if ! download_xray_from_gitee "$version" "$asset" "$zip_file"; then
-    download_xray_fallback "$version" "$asset" "$zip_file" \
-      || die "Failed to download Xray from Gitee and all fallback sources."
+  info "Installing Xray ${XRAY_VERSION} (${asset})..."
+  if ! download_xray_from_gitee "$XRAY_VERSION" "$asset" "$zip_file"; then
+    download_xray_fallback "$XRAY_VERSION" "$asset" "$zip_file" \
+      || die "Failed to download Xray from all configured sources."
   fi
 
   unzip -tq "$zip_file" >/dev/null || die "Downloaded Xray archive is corrupt."
@@ -307,9 +293,10 @@ with open(out, "w", encoding="utf-8") as f:
 print(f"Parsed VLESS: host={host}, port={port}, network={network}, security={security}")
 PY
   chmod 600 "$XRAY_CONFIG"
+  unset VLESS_URI
 }
 
-install_proxy_helpers() {
+install_profile_helpers() {
   cat >"$XRAY_PROFILE" <<'EOF'
 # Xray local proxy helpers.
 proxy_on() {
@@ -323,197 +310,75 @@ proxy_on() {
   export no_proxy="$NO_PROXY"
   echo "Xray proxy enabled for this shell."
 }
+
 proxy_off() {
   unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy NO_PROXY no_proxy
   echo "Proxy variables cleared for this shell."
 }
-# Recommended when this VPS is about to be returned/transferred.
-# Because this is a shell function, it can clear the current Bash history buffer
-# before the manager removes persistent files and credentials.
+
+# Recommended immediately before returning/transferring a VPS.
+# It removes vless:// entries from the current Bash history buffer, writes the
+# cleaned history back to disk, then performs the normal uninstall + persisted
+# history scrub. It intentionally does not erase unrelated shell history.
 xray_return_cleanup() {
+  proxy_off >/dev/null 2>&1 || true
   if [[ -n "${BASH_VERSION:-}" ]]; then
-    history -c 2>/dev/null || true
-    history -w 2>/dev/null || true
+    local _ids=() _id
+    while IFS= read -r _id; do
+      [[ -n "$_id" ]] && _ids+=("$_id")
+    done < <(builtin history | awk 'tolower($0) ~ /vless:\/\// {print $1}' | sort -rn)
+    for _id in "${_ids[@]}"; do
+      builtin history -d "$_id" 2>/dev/null || true
+    done
+    builtin history -w 2>/dev/null || true
   fi
   sudo xray-vless-manager uninstall --purge-history
 }
 EOF
   chmod 0644 "$XRAY_PROFILE"
+}
 
-  cat >/usr/local/bin/xray-proxy-test <<'EOF'
-#!/usr/bin/env bash
-set -u
-SOCKS="127.0.0.1:10808"
-HTTP="http://127.0.0.1:10809"
-printf 'Xray service:      '
-systemctl is-active xray 2>/dev/null || true
-printf 'Google via SOCKS:  '
-curl -o /dev/null -sS -w '%{http_code}\n' --max-time 20 --socks5-hostname "$SOCKS" https://www.google.com/ || true
-printf 'GitHub via HTTP:   '
-curl -o /dev/null -sS -w '%{http_code}\n' --max-time 20 -x "$HTTP" https://github.com/ || true
-printf 'Proxy exit IP:     '
-curl -fsS --max-time 20 --socks5-hostname "$SOCKS" https://api.ipify.org || true
-echo
-EOF
-  chmod 0755 /usr/local/bin/xray-proxy-test
+fetch_small_tool() {
+  local name="$1" output="$2" url mirror
+  url="${TOOLS_RAW_BASE}/${name}"
+  if curl -fsSL --connect-timeout 6 --max-time 20 "$url" -o "$output"; then
+    return 0
+  fi
+  rm -f "$output"
+  for mirror in "${XRAY_MIRRORS[@]}"; do
+    if curl -fsSL --connect-timeout 6 --max-time 20 "${mirror}${url}" -o "$output"; then
+      return 0
+    fi
+    rm -f "$output"
+  done
+  return 1
+}
+
+install_repo_tool() {
+  local name="$1" target="$2" source="${SCRIPT_DIR}/${name}" tmp
+  if [[ -f "$source" ]]; then
+    install -m 0755 "$source" "$target"
+    return 0
+  fi
+  if [[ -x "$target" ]]; then
+    info "Keeping installed helper: ${target}"
+    return 0
+  fi
+  tmp="$(mktemp)"
+  if fetch_small_tool "$name" "$tmp"; then
+    install -m 0755 "$tmp" "$target"
+    rm -f "$tmp"
+    return 0
+  fi
+  rm -f "$tmp"
+  die "Missing ${name}. Run the installer from a full clone of this repository."
 }
 
 install_management_tools() {
   mkdir -p "$XRAY_LIBEXEC_DIR"
-  local src dst
-  src="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
-  dst="$(readlink -f "$XRAY_BOOTSTRAP" 2>/dev/null || printf '%s' "$XRAY_BOOTSTRAP")"
-  if [[ "$src" != "$dst" ]]; then
-    install -m 0700 "$0" "$XRAY_BOOTSTRAP"
-  fi
-
-  cat >"$XRAY_MANAGER" <<'EOF'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-CONFIG="/usr/local/etc/xray/config.json"
-BOOTSTRAP="/usr/local/libexec/xray-vless/setup-xray-vless.sh"
-DOCKER_PROXY="/etc/systemd/system/docker.service.d/xray-proxy.conf"
-
-need_root() {
-  [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo "Please run with sudo." >&2; exit 1; }
-}
-
-remove_config_files() {
-  rm -f "$CONFIG"
-  find "$(dirname "$CONFIG")" -maxdepth 1 -type f -name 'config.json.bak.*' -delete 2>/dev/null || true
-}
-
-remove_docker_proxy() {
-  if [[ -f "$DOCKER_PROXY" ]]; then
-    rm -f "$DOCKER_PROXY"
-    systemctl daemon-reload
-    if systemctl list-unit-files docker.service >/dev/null 2>&1; then
-      systemctl restart docker 2>/dev/null || true
-    fi
-  fi
-}
-
-scrub_vless_history_files() {
-  need_root
-  python3 - <<'PY'
-import os, pwd
-
-names = {'.bash_history', '.zsh_history', '.sh_history', '.ash_history'}
-homes = {'/root'}
-for p in pwd.getpwall():
-    home = p.pw_dir
-    if home and home.startswith('/') and os.path.isdir(home):
-        homes.add(home)
-
-changed = 0
-removed = 0
-for home in sorted(homes):
-    for name in names:
-        path = os.path.join(home, name)
-        if not os.path.isfile(path):
-            continue
-        try:
-            with open(path, 'rb') as f:
-                data = f.readlines()
-            kept = []
-            local_removed = 0
-            for line in data:
-                if b'vless://' in line.lower():
-                    local_removed += 1
-                else:
-                    kept.append(line)
-            if local_removed:
-                st = os.stat(path)
-                with open(path, 'wb') as f:
-                    f.writelines(kept)
-                os.chmod(path, st.st_mode)
-                try:
-                    os.chown(path, st.st_uid, st.st_gid)
-                except PermissionError:
-                    pass
-                changed += 1
-                removed += local_removed
-        except OSError as e:
-            print(f'Warning: could not scrub {path}: {e}')
-print(f'Shell history scrub: removed {removed} VLESS-containing line(s) from {changed} file(s).')
-PY
-}
-
-case "${1:-help}" in
-  status)
-    echo "Xray service:  $(systemctl is-active xray 2>/dev/null || true)"
-    [[ -f "$CONFIG" ]] && echo "Node config:   present" || echo "Node config:   absent"
-    [[ -f "$DOCKER_PROXY" ]] && echo "Docker proxy:  configured" || echo "Docker proxy:  not configured"
-    ;;
-  test)
-    exec xray-proxy-test
-    ;;
-  set-node|change-node)
-    need_root
-    [[ -x "$BOOTSTRAP" ]] || { echo "Bootstrap file is missing: $BOOTSTRAP" >&2; exit 1; }
-    exec "$BOOTSTRAP"
-    ;;
-  remove-node)
-    need_root
-    systemctl disable --now xray 2>/dev/null || true
-    remove_config_files
-    remove_docker_proxy
-    echo "Node configuration removed and Xray stopped."
-    echo "If proxy_on was used in this shell, run: proxy_off"
-    ;;
-  purge-history)
-    scrub_vless_history_files
-    ;;
-  uninstall)
-    need_root
-    systemctl disable --now xray 2>/dev/null || true
-    remove_config_files
-    remove_docker_proxy
-    if [[ "${2:-}" == "--purge-history" ]]; then
-      scrub_vless_history_files
-    fi
-    rm -f /etc/systemd/system/xray.service
-    rm -f /usr/local/bin/xray /usr/local/bin/xray-proxy-test
-    rm -f /etc/profile.d/xray-proxy.sh
-    rm -rf /usr/local/share/xray /usr/local/etc/xray /usr/local/libexec/xray-vless
-    systemctl daemon-reload
-    rm -f /usr/local/bin/xray-vless-manager
-    echo "Xray, node credentials, proxy helpers and Docker proxy configuration removed."
-    if [[ "${2:-}" == "--purge-history" ]]; then
-      echo "Persistent shell-history files were also scrubbed for lines containing vless://."
-      echo "For Bash, xray_return_cleanup is preferred because it also clears the current shell's in-memory history before uninstall."
-    else
-      echo "History was NOT scrubbed. For server return/transfer, use xray_return_cleanup or uninstall --purge-history."
-    fi
-    ;;
-  help|-h|--help)
-    cat <<'HELP'
-Xray VLESS manager
-
-  xray-vless-manager status                 Show current state
-  xray-vless-manager test                   Test Google/GitHub/proxy exit
-  sudo xray-vless-manager set-node          Replace/add VLESS node (hidden input)
-  sudo xray-vless-manager remove-node       Remove personal node config, keep Xray installed
-  sudo xray-vless-manager purge-history     Remove vless:// lines from persisted shell histories
-  sudo xray-vless-manager uninstall         Remove Xray/config but keep shell history untouched
-  sudo xray-vless-manager uninstall --purge-history
-                                             Also scrub persisted VLESS history lines
-
-Recommended before returning/transferring a Bash-managed VPS:
-  xray_return_cleanup
-
-Shell proxy switch:
-  proxy_on
-  proxy_off
-HELP
-    ;;
-  *)
-    echo "Unknown command: $1" >&2
-    exit 2
-    ;;
-esac
-EOF
-  chmod 0755 "$XRAY_MANAGER"
+  install -m 0700 "$0" "$XRAY_BOOTSTRAP"
+  install_repo_tool "xray-vless-manager" "$XRAY_MANAGER"
+  install_repo_tool "xray-proxy-test" "$XRAY_TEST"
 }
 
 configure_docker_proxy() {
@@ -522,7 +387,7 @@ configure_docker_proxy() {
     return
   fi
   info "Configuring Docker daemon to use local Xray HTTP proxy..."
-  mkdir -p /etc/systemd/system/docker.service.d
+  mkdir -p "$(dirname "$DOCKER_PROXY_FILE")"
   cat >"$DOCKER_PROXY_FILE" <<'EOF'
 [Service]
 Environment="HTTP_PROXY=http://127.0.0.1:10809"
@@ -549,41 +414,23 @@ start_and_test() {
   echo "  HTTP:   http://127.0.0.1:10809"
   echo "  Routing: private/CN -> DIRECT; everything else -> VLESS"
   echo
-
-  info "Testing proxy public IP..."
-  PROXY_IP="$(curl -4fsS --max-time 20 --socks5-hostname 127.0.0.1:10808 https://api.ipify.org || true)"
-  echo "  Proxy IP: ${PROXY_IP:-<failed>}"
-
-  info "Testing GitHub through proxy..."
-  GITHUB_STATUS="$(curl -o /dev/null -sS -w '%{http_code}' --max-time 20 --socks5-hostname 127.0.0.1:10808 https://github.com/ || true)"
-  echo "  GitHub HTTP status: ${GITHUB_STATUS:-<failed>}"
-
-  info "Testing Google through proxy..."
-  GOOGLE_STATUS="$(curl -o /dev/null -sS -w '%{http_code}' --max-time 20 --socks5-hostname 127.0.0.1:10808 https://www.google.com/ || true)"
-  echo "  Google HTTP status: ${GOOGLE_STATUS:-<failed>}"
-
-  if [[ -n "$PROXY_IP" && "$GITHUB_STATUS" =~ ^(200|301|302)$ && "$GOOGLE_STATUS" =~ ^(200|301|302)$ ]]; then
-    echo "SUCCESS: Xray VLESS path, GitHub and Google access are working."
-  else
-    echo "WARNING: one or more proxy checks failed."
-    echo "Run: xray-vless-manager test"
-  fi
+  "$XRAY_TEST" || true
 }
 
 install_deps
 install_xray
 ensure_service
 make_config
-install_proxy_helpers
+install_profile_helpers
 install_management_tools
 start_and_test
 configure_docker_proxy
 
 echo
-echo "Daily commands:"
+echo "Installed commands:"
 echo "  xray-vless-manager status"
 echo "  xray-vless-manager test"
 echo "  proxy_on / proxy_off"
 echo "  sudo xray-vless-manager set-node"
 echo "  sudo xray-vless-manager remove-node"
-echo "  xray_return_cleanup   # recommended before returning/transferring this VPS"
+echo "  xray_return_cleanup   # before returning/transferring this VPS"
