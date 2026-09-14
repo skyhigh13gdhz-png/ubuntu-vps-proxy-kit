@@ -1,0 +1,4 @@
+*.log
+vps-report-*.txt
+.env
+.DS_Store
