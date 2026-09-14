@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -u
+
+SOCKS="127.0.0.1:10808"
+HTTP="http://127.0.0.1:10809"
+FAILED=0
+
+check_http() {
+  local label="$1" mode="$2" url="$3" status
+  if [[ "$mode" == "socks" ]]; then
+    status="$(curl -o /dev/null -sS -w '%{http_code}' --max-time 20 --socks5-hostname "$SOCKS" "$url" 2>/dev/null || true)"
+  else
+    status="$(curl -o /dev/null -sS -w '%{http_code}' --max-time 20 -x "$HTTP" "$url" 2>/dev/null || true)"
+  fi
+
+  if [[ "$status" =~ ^(200|204|301|302|307|308)$ ]]; then
+    printf '%-21s OK (%s)\n' "$label:" "$status"
+  else
+    printf '%-21s FAILED (%s)\n' "$label:" "${status:-no response}"
+    FAILED=1
+  fi
+}
+
+if systemctl is-active --quiet xray 2>/dev/null; then
+  printf '%-21s OK\n' "Xray service:"
+else
+  printf '%-21s FAILED\n' "Xray service:"
+  FAILED=1
+fi
+
+check_http "Google via SOCKS" socks "https://www.google.com/"
+check_http "GitHub via HTTP" http "https://github.com/"
+
+PROXY_IP="$(curl -4fsS --max-time 20 --socks5-hostname "$SOCKS" https://api.ipify.org 2>/dev/null || true)"
+if [[ -n "$PROXY_IP" ]]; then
+  printf '%-21s %s\n' "Proxy exit IP:" "$PROXY_IP"
+else
+  printf '%-21s FAILED\n' "Proxy exit IP:"
+  FAILED=1
+fi
+
+if [[ "$FAILED" -eq 0 ]]; then
+  echo "RESULT: proxy path is healthy."
+else
+  echo "RESULT: one or more checks failed."
+  echo "Logs: journalctl -u xray -n 100 --no-pager"
+fi
+
+exit "$FAILED"
