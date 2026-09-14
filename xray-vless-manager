@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CONFIG="/usr/local/etc/xray/config.json"
+BOOTSTRAP="/usr/local/libexec/xray-vless/setup-xray-vless.sh"
+DOCKER_PROXY="/etc/systemd/system/docker.service.d/xray-proxy.conf"
+PROFILE="/etc/profile.d/xray-proxy.sh"
+
+need_root() {
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo "Please run with sudo." >&2; exit 1; }
+}
+
+remove_config_files() {
+  rm -f "$CONFIG"
+  local dir
+  dir="$(dirname "$CONFIG")"
+  [[ -d "$dir" ]] && find "$dir" -maxdepth 1 -type f -name 'config.json.bak.*' -delete 2>/dev/null || true
+}
+
+remove_docker_proxy() {
+  if [[ -f "$DOCKER_PROXY" ]]; then
+    rm -f "$DOCKER_PROXY"
+    systemctl daemon-reload
+    if systemctl list-unit-files docker.service >/dev/null 2>&1; then
+      systemctl restart docker 2>/dev/null || true
+    fi
+  fi
+}
+
+scrub_vless_history_files() {
+  need_root
+  python3 - <<'PY'
+import os, pwd
+names = {'.bash_history', '.zsh_history', '.sh_history', '.ash_history'}
+homes = {'/root'}
+for p in pwd.getpwall():
+    home = p.pw_dir
+    if home and home.startswith('/') and os.path.isdir(home):
+        homes.add(home)
+
+changed = removed = 0
+for home in sorted(homes):
+    for name in names:
+        path = os.path.join(home, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, 'rb') as f:
+                lines = f.readlines()
+            kept = [line for line in lines if b'vless://' not in line.lower()]
+            local_removed = len(lines) - len(kept)
+            if not local_removed:
+                continue
+            st = os.stat(path)
+            tmp = path + '.xray-clean.tmp'
+            with open(tmp, 'wb') as f:
+                f.writelines(kept)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, st.st_mode)
+            try:
+                os.chown(tmp, st.st_uid, st.st_gid)
+            except PermissionError:
+                pass
+            os.replace(tmp, path)
+            changed += 1
+            removed += local_removed
+        except OSError as e:
+            print(f'Warning: could not scrub {path}: {e}')
+print(f'Shell history scrub: removed {removed} VLESS-containing line(s) from {changed} file(s).')
+PY
+}
+
+show_status() {
+  local state
+  state="$(systemctl is-active xray 2>/dev/null || true)"
+  echo "Xray service:  ${state:-unknown}"
+  [[ -f "$CONFIG" ]] && echo "Node config:   present" || echo "Node config:   absent"
+  [[ -f "$DOCKER_PROXY" ]] && echo "Docker proxy:  configured" || echo "Docker proxy:  not configured"
+}
+
+case "${1:-help}" in
+  status)
+    show_status
+    ;;
+  test)
+    exec xray-proxy-test
+    ;;
+  set-node|change-node)
+    need_root
+    [[ -x "$BOOTSTRAP" ]] || { echo "Bootstrap file is missing: $BOOTSTRAP" >&2; exit 1; }
+    exec "$BOOTSTRAP"
+    ;;
+  remove-node)
+    need_root
+    systemctl disable --now xray 2>/dev/null || true
+    remove_config_files
+    remove_docker_proxy
+    echo "Node configuration removed and Xray stopped."
+    echo "If this shell previously ran proxy_on, run proxy_off now."
+    ;;
+  purge-history)
+    scrub_vless_history_files
+    ;;
+  uninstall)
+    need_root
+    PURGE_HISTORY=0
+    [[ "${2:-}" == "--purge-history" ]] && PURGE_HISTORY=1
+
+    systemctl disable --now xray 2>/dev/null || true
+    remove_config_files
+    remove_docker_proxy
+    [[ "$PURGE_HISTORY" -eq 1 ]] && scrub_vless_history_files
+
+    rm -f /etc/systemd/system/xray.service
+    rm -f /usr/local/bin/xray /usr/local/bin/xray-proxy-test
+    rm -f "$PROFILE"
+    rm -rf /usr/local/share/xray /usr/local/etc/xray /usr/local/libexec/xray-vless
+    systemctl daemon-reload
+    rm -f /usr/local/bin/xray-vless-manager
+
+    echo "Xray, node credentials, helper commands and Docker proxy configuration removed."
+    if [[ "$PURGE_HISTORY" -eq 1 ]]; then
+      echo "Persisted shell-history lines containing vless:// were also removed."
+      echo "For Bash, xray_return_cleanup is preferred before uninstall because it can also scrub the current shell's in-memory history."
+    else
+      echo "Shell history was not changed. For server return/transfer use xray_return_cleanup."
+    fi
+    ;;
+  help|-h|--help)
+    cat <<'HELP'
+Xray VLESS manager
+
+  xray-vless-manager status
+      Show service/node/Docker-proxy state.
+
+  xray-vless-manager test
+      Run proxy health checks.
+
+  sudo xray-vless-manager set-node
+      Add or replace the VLESS node using hidden input.
+
+  sudo xray-vless-manager remove-node
+      Delete personal node config and stop Xray, but keep the software installed.
+
+  sudo xray-vless-manager purge-history
+      Remove persisted shell-history lines that contain vless://.
+
+  sudo xray-vless-manager uninstall
+      Remove Xray and local configuration; do not touch shell history.
+
+  sudo xray-vless-manager uninstall --purge-history
+      Also scrub persisted vless:// shell-history lines.
+
+Recommended before returning/transferring a Bash-managed VPS:
+  xray_return_cleanup
+
+Shell proxy switches:
+  proxy_on
+  proxy_off
+HELP
+    ;;
+  *)
+    echo "Unknown command: $1" >&2
+    exit 2
+    ;;
+esac
