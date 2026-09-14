@@ -18,13 +18,19 @@ XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_ASSET_DIR="/usr/local/share/xray"
 XRAY_TMP_DIR="/tmp/xray-bootstrap"
-XRAY_GITHUB_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
+
+# Mainland-first binary mirror. Each Xray version is stored as a branch in Gitee.
+# Override at runtime if needed, for example:
+#   XRAY_VERSION=v26.3.27 sudo -E bash setup-xray-vless.sh
+XRAY_VERSION="${XRAY_VERSION:-v26.3.27}"
+XRAY_GITEE_REPO="https://gitee.com/skyhigh13/xray_bin.git"
+
+# Fallbacks are kept only for resilience when Gitee is unavailable.
 XRAY_GITHUB_DOWNLOAD_BASE="https://github.com/XTLS/Xray-core/releases/download"
 XRAY_SOURCEFORGE_BASE="https://sourceforge.net/projects/xray-core.mirror/files"
 XRAY_MIRRORS=(
-  "https://ghproxy.net/"
   "https://gh.ddlc.top/"
-  "https://gh.llkk.cc/"
+  "https://ghproxy.net/"
 )
 
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -43,11 +49,11 @@ fi
 install_deps() {
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update -y
-    DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates python3 jq unzip
+    DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates python3 jq unzip git
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y curl ca-certificates python3 jq unzip
+    dnf install -y curl ca-certificates python3 jq unzip git
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y curl ca-certificates python3 jq unzip
+    yum install -y curl ca-certificates python3 jq unzip git
   else
     die "Unsupported distro: apt/dnf/yum not found."
   fi
@@ -62,59 +68,68 @@ get_arch_asset() {
   esac
 }
 
-fetch_latest_version() {
-  local json version mirror
-  json="$(curl -fsSL --connect-timeout 8 --max-time 15 "$XRAY_GITHUB_API" 2>/dev/null || true)"
-  version="$(printf '%s' "$json" | jq -r '.tag_name // empty' 2>/dev/null || true)"
-  if [[ -n "$version" ]]; then
-    printf '%s' "$version"
-    return 0
+download_xray_from_gitee() {
+  local version="$1" asset="$2" output="$3"
+  local clone_dir="${XRAY_TMP_DIR}/gitee-xray-bin"
+
+  info "Trying mainland Gitee binary mirror (${version})..."
+  rm -rf "$clone_dir"
+
+  if ! git -c advice.detachedHead=false clone \
+      --quiet \
+      --depth 1 \
+      --single-branch \
+      --branch "$version" \
+      "$XRAY_GITEE_REPO" \
+      "$clone_dir"; then
+    rm -rf "$clone_dir"
+    return 1
   fi
 
-  info "GitHub API is slow/unavailable; trying mirrors..." >&2
-  for mirror in "${XRAY_MIRRORS[@]}"; do
-    json="$(curl -fsSL --connect-timeout 8 --max-time 15 "${mirror}${XRAY_GITHUB_API}" 2>/dev/null || true)"
-    version="$(printf '%s' "$json" | jq -r '.tag_name // empty' 2>/dev/null || true)"
-    if [[ -n "$version" ]]; then
-      printf '%s' "$version"
-      return 0
-    fi
-  done
+  if [[ ! -f "${clone_dir}/${asset}" ]]; then
+    info "Gitee branch exists but ${asset} is missing."
+    rm -rf "$clone_dir"
+    return 1
+  fi
 
-  die "Unable to determine latest Xray release."
+  cp -f "${clone_dir}/${asset}" "$output"
+  rm -rf "$clone_dir"
+
+  unzip -tq "$output" >/dev/null || {
+    info "Gitee archive failed ZIP integrity check."
+    rm -f "$output"
+    return 1
+  }
+
+  info "Downloaded ${asset} from Gitee successfully."
+  return 0
 }
 
-download_xray_asset() {
+download_xray_fallback() {
   local version="$1" asset="$2" output="$3" mirror
   local github_url="${XRAY_GITHUB_DOWNLOAD_BASE}/${version}/${asset}"
   local sourceforge_url="${XRAY_SOURCEFORGE_BASE}/${version}/${asset}/download"
 
-  # Mainland VPS: SourceForge maintains an exact Xray-core mirror and is often
-  # much faster than GitHub release delivery from mainland China.
-  info "Trying SourceForge Xray mirror first..."
-  if curl -fL --retry 0 --connect-timeout 6 --speed-time 10 --speed-limit 102400 --max-time 120 \
+  info "Gitee unavailable; trying SourceForge fallback..."
+  if curl -fL --retry 1 --connect-timeout 6 --speed-time 15 --speed-limit 20480 \
       "$sourceforge_url" -o "$output"; then
-    return 0
+    unzip -tq "$output" >/dev/null && return 0
   fi
   rm -f "$output"
 
-  # Then try GitHub acceleration mirrors. Abort quickly when sustained speed
-  # is below 100 KiB/s so a bad mirror cannot hold the install for minutes.
   for mirror in "${XRAY_MIRRORS[@]}"; do
-    info "Trying GitHub mirror: $mirror"
-    if curl -fL --retry 0 --connect-timeout 6 --speed-time 10 --speed-limit 102400 --max-time 75 \
+    info "Trying GitHub fallback mirror: $mirror"
+    if curl -fL --retry 1 --connect-timeout 6 --speed-time 15 --speed-limit 20480 \
         "${mirror}${github_url}" -o "$output"; then
-      return 0
+      unzip -tq "$output" >/dev/null && return 0
     fi
     rm -f "$output"
   done
 
-  # Official GitHub is the final fallback. Keep a lower speed threshold here
-  # so installation can still finish if every mirror is unavailable.
-  info "All mirrors failed; falling back to official GitHub..."
-  if curl -fL --retry 0 --connect-timeout 8 --speed-time 15 --speed-limit 20480 --max-time 180 \
+  info "Trying official GitHub as final fallback..."
+  if curl -fL --retry 1 --connect-timeout 8 --speed-time 20 --speed-limit 10240 \
       "$github_url" -o "$output"; then
-    return 0
+    unzip -tq "$output" >/dev/null && return 0
   fi
 
   rm -f "$output"
@@ -129,14 +144,18 @@ install_xray() {
 
   local asset version zip_file
   asset="$(get_arch_asset)"
-  version="$(fetch_latest_version)"
+  version="$XRAY_VERSION"
 
   rm -rf "$XRAY_TMP_DIR"
   mkdir -p "$XRAY_TMP_DIR"
   zip_file="${XRAY_TMP_DIR}/${asset}"
 
   info "Installing Xray ${version} (${asset})..."
-  download_xray_asset "$version" "$asset" "$zip_file" || die "Failed to download Xray from SourceForge, configured mirrors, and GitHub."
+
+  if ! download_xray_from_gitee "$version" "$asset" "$zip_file"; then
+    download_xray_fallback "$version" "$asset" "$zip_file" \
+      || die "Failed to download Xray from Gitee and all fallback sources."
+  fi
 
   unzip -tq "$zip_file" >/dev/null || die "Downloaded Xray archive is corrupt."
   unzip -oq "$zip_file" -d "$XRAY_TMP_DIR"
