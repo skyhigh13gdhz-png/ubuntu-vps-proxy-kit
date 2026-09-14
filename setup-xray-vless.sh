@@ -3,7 +3,8 @@ set -Eeuo pipefail
 
 # Tencent/China VPS -> Xray client -> VLESS Malaysia node
 # Usage:
-#   sudo bash setup-xray-vless.sh 'vless://...'
+#   sudo bash setup-xray-vless.sh
+# Then paste the VLESS URI when prompted; input is hidden and is not stored in shell history.
 #
 # Default routing:
 #   private + CN -> DIRECT
@@ -14,41 +15,145 @@ set -Eeuo pipefail
 #   HTTP:   127.0.0.1:10809
 
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
-XRAY_INSTALLER="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+XRAY_BIN="/usr/local/bin/xray"
+XRAY_ASSET_DIR="/usr/local/share/xray"
+XRAY_TMP_DIR="/tmp/xray-bootstrap"
+XRAY_GITHUB_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
+XRAY_GITHUB_DOWNLOAD_BASE="https://github.com/XTLS/Xray-core/releases/download"
+XRAY_MIRRORS=(
+  "https://ghproxy.net/"
+  "https://gh-proxy.com/"
+  "https://gh.ddlc.top/"
+  "https://gh.llkk.cc/"
+)
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "[+] $*"; }
 
 [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Please run as root (sudo)."
-[[ $# -ge 1 ]] || die "Usage: sudo bash $0 'vless://...'"
 
-VLESS_URI="$1"
-[[ "$VLESS_URI" == vless://* ]] || die "The first argument must be a vless:// URI."
+if [[ $# -ge 1 ]]; then
+  VLESS_URI="$1"
+else
+  read -r -s -p "Paste VLESS URI: " VLESS_URI
+  echo
+fi
+[[ "$VLESS_URI" == vless://* ]] || die "The VLESS URI must start with vless://"
 
 install_deps() {
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update -y
-    DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates python3 jq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates python3 jq unzip
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y curl ca-certificates python3 jq
+    dnf install -y curl ca-certificates python3 jq unzip
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y curl ca-certificates python3 jq
+    yum install -y curl ca-certificates python3 jq unzip
   else
     die "Unsupported distro: apt/dnf/yum not found."
   fi
 }
 
+get_arch_asset() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "Xray-linux-64.zip" ;;
+    aarch64|arm64) echo "Xray-linux-arm64-v8a.zip" ;;
+    armv7l|armv7) echo "Xray-linux-arm32-v7a.zip" ;;
+    *) die "Unsupported CPU architecture: $(uname -m)" ;;
+  esac
+}
+
+fetch_latest_version() {
+  local json version mirror
+  json="$(curl -fsSL --connect-timeout 8 --max-time 15 "$XRAY_GITHUB_API" 2>/dev/null || true)"
+  version="$(printf '%s' "$json" | jq -r '.tag_name // empty' 2>/dev/null || true)"
+  if [[ -n "$version" ]]; then
+    printf '%s' "$version"
+    return 0
+  fi
+
+  info "GitHub API is slow/unavailable; trying mirrors..." >&2
+  for mirror in "${XRAY_MIRRORS[@]}"; do
+    json="$(curl -fsSL --connect-timeout 8 --max-time 15 "${mirror}${XRAY_GITHUB_API}" 2>/dev/null || true)"
+    version="$(printf '%s' "$json" | jq -r '.tag_name // empty' 2>/dev/null || true)"
+    if [[ -n "$version" ]]; then
+      printf '%s' "$version"
+      return 0
+    fi
+  done
+
+  die "Unable to determine latest Xray release."
+}
+
+download_with_fallback() {
+  local url="$1" output="$2" mirror
+
+  info "Trying official GitHub download..."
+  if curl -fL --retry 1 --connect-timeout 8 --speed-time 15 --speed-limit 20480 --max-time 90 "$url" -o "$output"; then
+    return 0
+  fi
+
+  rm -f "$output"
+  for mirror in "${XRAY_MIRRORS[@]}"; do
+    info "Trying GitHub mirror: $mirror"
+    if curl -fL --retry 1 --connect-timeout 8 --speed-time 15 --speed-limit 20480 --max-time 120 "${mirror}${url}" -o "$output"; then
+      return 0
+    fi
+    rm -f "$output"
+  done
+
+  return 1
+}
+
 install_xray() {
-  if command -v xray >/dev/null 2>&1; then
-    info "Xray already installed: $(xray version | head -n1)"
+  if [[ -x "$XRAY_BIN" ]]; then
+    info "Xray already installed: $($XRAY_BIN version | head -n1)"
     return
   fi
-  info "Installing Xray using the official XTLS installer..."
-  tmp="$(mktemp)"
-  curl -fL --retry 3 --connect-timeout 15 "$XRAY_INSTALLER" -o "$tmp" \
-    || die "Failed to download the official Xray installer from GitHub."
-  bash "$tmp" install
-  rm -f "$tmp"
+
+  local asset version download_url zip_file
+  asset="$(get_arch_asset)"
+  version="$(fetch_latest_version)"
+  download_url="${XRAY_GITHUB_DOWNLOAD_BASE}/${version}/${asset}"
+
+  rm -rf "$XRAY_TMP_DIR"
+  mkdir -p "$XRAY_TMP_DIR"
+  zip_file="${XRAY_TMP_DIR}/${asset}"
+
+  info "Installing Xray ${version} (${asset})..."
+  download_with_fallback "$download_url" "$zip_file" || die "Failed to download Xray from GitHub and all configured mirrors."
+
+  unzip -tq "$zip_file" >/dev/null || die "Downloaded Xray archive is corrupt."
+  unzip -oq "$zip_file" -d "$XRAY_TMP_DIR"
+  [[ -f "${XRAY_TMP_DIR}/xray" ]] || die "Xray binary missing from archive."
+
+  install -m 0755 "${XRAY_TMP_DIR}/xray" "$XRAY_BIN"
+  mkdir -p "$XRAY_ASSET_DIR"
+  [[ -f "${XRAY_TMP_DIR}/geoip.dat" ]] && install -m 0644 "${XRAY_TMP_DIR}/geoip.dat" "$XRAY_ASSET_DIR/geoip.dat"
+  [[ -f "${XRAY_TMP_DIR}/geosite.dat" ]] && install -m 0644 "${XRAY_TMP_DIR}/geosite.dat" "$XRAY_ASSET_DIR/geosite.dat"
+
+  cat >/etc/systemd/system/xray.service <<'EOF'
+[Unit]
+Description=Xray Service
+Documentation=https://github.com/XTLS/Xray-core
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+Environment=XRAY_LOCATION_ASSET=/usr/local/share/xray
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  rm -rf "$XRAY_TMP_DIR"
+  info "Xray installed successfully: $($XRAY_BIN version | head -n1)"
 }
 
 make_config() {
@@ -163,7 +268,6 @@ elif network == "xhttp":
     stream["xhttpSettings"] = xh
 
 elif network == "tcp":
-    # Plain TCP needs no extra transport settings for normal VLESS/REALITY.
     pass
 
 config = {
@@ -230,7 +334,6 @@ config = {
 with open(out, "w", encoding="utf-8") as f:
     json.dump(config, f, ensure_ascii=False, indent=2)
 
-# Only print non-secret summary.
 print(f"Parsed VLESS: host={host}, port={port}, network={network}, security={security}")
 PY
 
@@ -239,7 +342,7 @@ PY
 
 start_and_test() {
   info "Validating Xray configuration..."
-  xray run -test -config "$XRAY_CONFIG"
+  XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$XRAY_BIN" run -test -config "$XRAY_CONFIG"
 
   systemctl daemon-reload
   systemctl enable --now xray
@@ -269,12 +372,16 @@ start_and_test() {
   PROXY_IP="$(curl -4fsS --max-time 20 --socks5-hostname 127.0.0.1:10808 https://api.ipify.org || true)"
   echo "  Proxy IP:  ${PROXY_IP:-<failed>}"
 
-  if [[ -n "$PROXY_IP" && "$PROXY_IP" != "$DIRECT_IP" ]]; then
+  info "Testing GitHub through the Malaysia proxy..."
+  GITHUB_STATUS="$(curl -o /dev/null -sS -w '%{http_code}' --max-time 20 --socks5-hostname 127.0.0.1:10808 https://github.com/ || true)"
+  echo "  GitHub HTTP status via proxy: ${GITHUB_STATUS:-<failed>}"
+
+  if [[ -n "$PROXY_IP" && "$PROXY_IP" != "$DIRECT_IP" && "$GITHUB_STATUS" =~ ^(200|301|302)$ ]]; then
     echo
-    echo "SUCCESS: proxy path is working."
+    echo "SUCCESS: Malaysia proxy path and GitHub access are working."
   else
     echo
-    echo "WARNING: proxy IP test did not clearly confirm a different egress IP."
+    echo "WARNING: proxy IP test did not clearly confirm a different egress IP or GitHub access failed."
     echo "Check: journalctl -u xray -n 100 --no-pager"
   fi
 }
