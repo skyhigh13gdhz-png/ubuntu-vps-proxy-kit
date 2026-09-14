@@ -87,20 +87,23 @@ fetch_latest_version() {
 download_with_fallback() {
   local url="$1" output="$2" mirror
 
-  info "Trying official GitHub download..."
-  if curl -fL --retry 1 --connect-timeout 8 --speed-time 15 --speed-limit 20480 --max-time 90 "$url" -o "$output"; then
-    return 0
-  fi
-
-  rm -f "$output"
+  # Mainland VPS: prefer mirrors first. The Xray release asset is much larger
+  # than the GitHub API response, so going straight to a mirror avoids wasting
+  # time on a very slow direct GitHub release download.
   for mirror in "${XRAY_MIRRORS[@]}"; do
-    info "Trying GitHub mirror: $mirror"
-    if curl -fL --retry 1 --connect-timeout 8 --speed-time 15 --speed-limit 20480 --max-time 120 "${mirror}${url}" -o "$output"; then
+    info "Trying GitHub mirror first: $mirror"
+    if curl -fL --retry 1 --connect-timeout 6 --speed-time 10 --speed-limit 51200 --max-time 90 "${mirror}${url}" -o "$output"; then
       return 0
     fi
     rm -f "$output"
   done
 
+  info "All mirrors failed; falling back to official GitHub..."
+  if curl -fL --retry 1 --connect-timeout 8 --speed-time 15 --speed-limit 20480 --max-time 120 "$url" -o "$output"; then
+    return 0
+  fi
+
+  rm -f "$output"
   return 1
 }
 
@@ -120,7 +123,7 @@ install_xray() {
   zip_file="${XRAY_TMP_DIR}/${asset}"
 
   info "Installing Xray ${version} (${asset})..."
-  download_with_fallback "$download_url" "$zip_file" || die "Failed to download Xray from GitHub and all configured mirrors."
+  download_with_fallback "$download_url" "$zip_file" || die "Failed to download Xray from all configured mirrors and GitHub."
 
   unzip -tq "$zip_file" >/dev/null || die "Downloaded Xray archive is corrupt."
   unzip -oq "$zip_file" -d "$XRAY_TMP_DIR"
