@@ -89,7 +89,16 @@ case "${1:-help}" in
   set-node|change-node)
     need_root
     [[ -x "$BOOTSTRAP" ]] || { echo "Bootstrap file is missing: $BOOTSTRAP" >&2; exit 1; }
-    exec "$BOOTSTRAP"
+    # Run a temporary copy so the bootstrap can safely refresh its installed copy.
+    tmp_bootstrap="$(mktemp /tmp/xray-vless-reconfigure.XXXXXX)"
+    cp -f "$BOOTSTRAP" "$tmp_bootstrap"
+    chmod 0700 "$tmp_bootstrap"
+    set +e
+    "$tmp_bootstrap"
+    rc=$?
+    set -e
+    rm -f "$tmp_bootstrap"
+    exit "$rc"
     ;;
   remove-node)
     need_root
