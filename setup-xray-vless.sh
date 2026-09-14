@@ -2,30 +2,22 @@
 set -Eeuo pipefail
 
 # China VPS -> local Xray client -> overseas VLESS node
-# Usage:
+# Normal install/reconfigure:
 #   sudo bash setup-xray-vless.sh
 # Then paste the VLESS URI when prompted; input is hidden and is not stored in shell history.
-#
-# Xray routing:
-#   private + CN -> DIRECT
-#   everything else -> VLESS
-#
-# Local proxy:
-#   SOCKS5: 127.0.0.1:10808
-#   HTTP:   127.0.0.1:10809
 
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_ASSET_DIR="/usr/local/share/xray"
 XRAY_TMP_DIR="/tmp/xray-bootstrap"
+XRAY_LIBEXEC_DIR="/usr/local/libexec/xray-vless"
+XRAY_BOOTSTRAP="${XRAY_LIBEXEC_DIR}/setup-xray-vless.sh"
+XRAY_MANAGER="/usr/local/bin/xray-vless-manager"
+XRAY_PROFILE="/etc/profile.d/xray-proxy.sh"
+DOCKER_PROXY_FILE="/etc/systemd/system/docker.service.d/xray-proxy.conf"
 
-# Mainland-first binary mirror. Each Xray version is stored as a branch in Gitee.
-# Override at runtime if needed:
-#   XRAY_VERSION=v26.3.27 sudo -E bash setup-xray-vless.sh
 XRAY_VERSION="${XRAY_VERSION:-v26.3.27}"
 XRAY_GITEE_REPO="https://gitee.com/skyhigh13/xray_bin.git"
-
-# Fallbacks are kept only for resilience when Gitee is unavailable.
 XRAY_GITHUB_DOWNLOAD_BASE="https://github.com/XTLS/Xray-core/releases/download"
 XRAY_SOURCEFORGE_BASE="https://sourceforge.net/projects/xray-core.mirror/files"
 XRAY_MIRRORS=(
@@ -76,12 +68,8 @@ download_xray_from_gitee() {
   rm -rf "$clone_dir"
 
   if ! git -c advice.detachedHead=false clone \
-      --quiet \
-      --depth 1 \
-      --single-branch \
-      --branch "$version" \
-      "$XRAY_GITEE_REPO" \
-      "$clone_dir"; then
+      --quiet --depth 1 --single-branch --branch "$version" \
+      "$XRAY_GITEE_REPO" "$clone_dir"; then
     rm -rf "$clone_dir"
     return 1
   fi
@@ -94,8 +82,6 @@ download_xray_from_gitee() {
 
   cp -f "${clone_dir}/${asset}" "$output"
 
-  # Prefer the mirrored digest when available. Xray .dgst files contain the
-  # official SHA2-256 value. ZIP integrity is still checked afterwards.
   if [[ -f "${clone_dir}/${asset}.dgst" ]]; then
     local expected actual
     expected="$(awk -F '= ' '/256=/{print $2; exit}' "${clone_dir}/${asset}.dgst" | tr -d '[:space:]')"
@@ -109,7 +95,6 @@ download_xray_from_gitee() {
   fi
 
   rm -rf "$clone_dir"
-
   unzip -tq "$output" >/dev/null || {
     info "Gitee archive failed ZIP integrity check."
     rm -f "$output"
@@ -117,7 +102,6 @@ download_xray_from_gitee() {
   }
 
   info "Downloaded ${asset} from Gitee successfully."
-  return 0
 }
 
 download_xray_fallback() {
@@ -166,7 +150,6 @@ install_xray() {
   zip_file="${XRAY_TMP_DIR}/${asset}"
 
   info "Installing Xray ${version} (${asset})..."
-
   if ! download_xray_from_gitee "$version" "$asset" "$zip_file"; then
     download_xray_fallback "$version" "$asset" "$zip_file" \
       || die "Failed to download Xray from Gitee and all fallback sources."
@@ -180,7 +163,11 @@ install_xray() {
   mkdir -p "$XRAY_ASSET_DIR"
   [[ -f "${XRAY_TMP_DIR}/geoip.dat" ]] && install -m 0644 "${XRAY_TMP_DIR}/geoip.dat" "$XRAY_ASSET_DIR/geoip.dat"
   [[ -f "${XRAY_TMP_DIR}/geosite.dat" ]] && install -m 0644 "${XRAY_TMP_DIR}/geosite.dat" "$XRAY_ASSET_DIR/geosite.dat"
+  rm -rf "$XRAY_TMP_DIR"
+  info "Xray installed successfully: $($XRAY_BIN version | head -n1)"
+}
 
+ensure_service() {
   cat >/etc/systemd/system/xray.service <<'EOF'
 [Unit]
 Description=Xray Service
@@ -200,17 +187,20 @@ Environment=XRAY_LOCATION_ASSET=/usr/local/share/xray
 [Install]
 WantedBy=multi-user.target
 EOF
-
   systemctl daemon-reload
-  rm -rf "$XRAY_TMP_DIR"
-  info "Xray installed successfully: $($XRAY_BIN version | head -n1)"
+}
+
+remove_old_sensitive_backups() {
+  local dir
+  dir="$(dirname "$XRAY_CONFIG")"
+  [[ -d "$dir" ]] || return 0
+  find "$dir" -maxdepth 1 -type f -name 'config.json.bak.*' -delete 2>/dev/null || true
 }
 
 make_config() {
   mkdir -p "$(dirname "$XRAY_CONFIG")"
-  if [[ -f "$XRAY_CONFIG" ]]; then
-    cp -a "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%Y%m%d-%H%M%S)"
-  fi
+  # Older script versions created credential-bearing backups. Do not retain them.
+  remove_old_sensitive_backups
 
   VLESS_URI="$VLESS_URI" python3 - "$XRAY_CONFIG" <<'PY'
 import json, os, sys
@@ -218,7 +208,6 @@ from urllib.parse import urlsplit, parse_qs, unquote
 
 uri = os.environ["VLESS_URI"]
 out = sys.argv[1]
-
 u = urlsplit(uri)
 if u.scheme.lower() != "vless":
     raise SystemExit("Not a VLESS URI")
@@ -238,7 +227,6 @@ encryption = q.get("encryption") or "none"
 user = {"id": uuid, "encryption": encryption}
 if flow:
     user["flow"] = flow
-
 stream = {"network": network, "security": security}
 
 if security == "tls":
@@ -300,7 +288,7 @@ config = {
          "protocol": "http", "settings": {}}
     ],
     "outbounds": [
-        {"tag": "malaysia", "protocol": "vless",
+        {"tag": "overseas", "protocol": "vless",
          "settings": {"vnext": [{"address": host, "port": port, "users": [user]}]},
          "streamSettings": stream},
         {"tag": "direct", "protocol": "freedom"},
@@ -317,19 +305,14 @@ config = {
 
 with open(out, "w", encoding="utf-8") as f:
     json.dump(config, f, ensure_ascii=False, indent=2)
-
 print(f"Parsed VLESS: host={host}, port={port}, network={network}, security={security}")
 PY
-
   chmod 600 "$XRAY_CONFIG"
 }
 
 install_proxy_helpers() {
-  # Do NOT force a machine-wide proxy. These helpers make proxy use explicit
-  # for interactive shell sessions while Xray itself still performs CN/direct
-  # versus overseas/VLESS routing.
-  cat >/etc/profile.d/xray-proxy.sh <<'EOF'
-# Xray local proxy helpers. Run `proxy_on` or `proxy_off` in an interactive shell.
+  cat >"$XRAY_PROFILE" <<'EOF'
+# Xray local proxy helpers.
 proxy_on() {
   export http_proxy="http://127.0.0.1:10809"
   export https_proxy="http://127.0.0.1:10809"
@@ -346,38 +329,129 @@ proxy_off() {
   echo "Proxy variables cleared for this shell."
 }
 EOF
-  chmod 0644 /etc/profile.d/xray-proxy.sh
+  chmod 0644 "$XRAY_PROFILE"
 
   cat >/usr/local/bin/xray-proxy-test <<'EOF'
 #!/usr/bin/env bash
 set -u
 SOCKS="127.0.0.1:10808"
 HTTP="http://127.0.0.1:10809"
-printf 'Xray service: '
+printf 'Xray service:      '
 systemctl is-active xray 2>/dev/null || true
-printf 'Google via SOCKS: '
+printf 'Google via SOCKS:  '
 curl -o /dev/null -sS -w '%{http_code}\n' --max-time 20 --socks5-hostname "$SOCKS" https://www.google.com/ || true
-printf 'GitHub via HTTP:  '
+printf 'GitHub via HTTP:   '
 curl -o /dev/null -sS -w '%{http_code}\n' --max-time 20 -x "$HTTP" https://github.com/ || true
-printf 'Proxy exit IP:    '
+printf 'Proxy exit IP:     '
 curl -fsS --max-time 20 --socks5-hostname "$SOCKS" https://api.ipify.org || true
 echo
 EOF
   chmod 0755 /usr/local/bin/xray-proxy-test
 }
 
+install_management_tools() {
+  mkdir -p "$XRAY_LIBEXEC_DIR"
+  local src dst
+  src="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+  dst="$(readlink -f "$XRAY_BOOTSTRAP" 2>/dev/null || printf '%s' "$XRAY_BOOTSTRAP")"
+  if [[ "$src" != "$dst" ]]; then
+    install -m 0700 "$0" "$XRAY_BOOTSTRAP"
+  fi
+
+  cat >"$XRAY_MANAGER" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+CONFIG="/usr/local/etc/xray/config.json"
+BOOTSTRAP="/usr/local/libexec/xray-vless/setup-xray-vless.sh"
+DOCKER_PROXY="/etc/systemd/system/docker.service.d/xray-proxy.conf"
+
+need_root() {
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo "Please run with sudo." >&2; exit 1; }
+}
+
+remove_config_files() {
+  rm -f "$CONFIG"
+  find "$(dirname "$CONFIG")" -maxdepth 1 -type f -name 'config.json.bak.*' -delete 2>/dev/null || true
+}
+
+remove_docker_proxy() {
+  if [[ -f "$DOCKER_PROXY" ]]; then
+    rm -f "$DOCKER_PROXY"
+    systemctl daemon-reload
+    if systemctl list-unit-files docker.service >/dev/null 2>&1; then
+      systemctl restart docker 2>/dev/null || true
+    fi
+  fi
+}
+
+case "${1:-help}" in
+  status)
+    echo "Xray service:  $(systemctl is-active xray 2>/dev/null || true)"
+    [[ -f "$CONFIG" ]] && echo "Node config:   present" || echo "Node config:   absent"
+    [[ -f "$DOCKER_PROXY" ]] && echo "Docker proxy:  configured" || echo "Docker proxy:  not configured"
+    ;;
+  test)
+    exec xray-proxy-test
+    ;;
+  set-node|change-node)
+    need_root
+    [[ -x "$BOOTSTRAP" ]] || { echo "Bootstrap file is missing: $BOOTSTRAP" >&2; exit 1; }
+    exec "$BOOTSTRAP"
+    ;;
+  remove-node)
+    need_root
+    systemctl disable --now xray 2>/dev/null || true
+    remove_config_files
+    remove_docker_proxy
+    echo "Node configuration removed and Xray stopped."
+    echo "If proxy_on was used in this shell, run: proxy_off"
+    ;;
+  uninstall)
+    need_root
+    systemctl disable --now xray 2>/dev/null || true
+    remove_config_files
+    remove_docker_proxy
+    rm -f /etc/systemd/system/xray.service
+    rm -f /usr/local/bin/xray /usr/local/bin/xray-proxy-test
+    rm -f /etc/profile.d/xray-proxy.sh
+    rm -rf /usr/local/share/xray /usr/local/etc/xray /usr/local/libexec/xray-vless
+    systemctl daemon-reload
+    rm -f /usr/local/bin/xray-vless-manager
+    echo "Xray, node credentials, proxy helpers and Docker proxy configuration removed."
+    echo "Existing shell proxy variables cannot be changed by a child process; reconnect or run proxy_off before uninstalling."
+    ;;
+  help|-h|--help)
+    cat <<'HELP'
+Xray VLESS manager
+
+  xray-vless-manager status       Show current state
+  xray-vless-manager test         Test Google/GitHub/proxy exit
+  sudo xray-vless-manager set-node     Replace/add VLESS node (hidden input)
+  sudo xray-vless-manager remove-node  Remove personal node config, keep Xray installed
+  sudo xray-vless-manager uninstall    Remove Xray and all local configuration
+
+Shell proxy switch:
+  proxy_on
+  proxy_off
+HELP
+    ;;
+  *)
+    echo "Unknown command: $1" >&2
+    exit 2
+    ;;
+esac
+EOF
+  chmod 0755 "$XRAY_MANAGER"
+}
+
 configure_docker_proxy() {
-  # If Docker is already installed, configure only the Docker daemon's outbound
-  # HTTP(S) requests (image pulls, registry access) through local Xray.
-  # Containers themselves do not automatically inherit this proxy.
   if ! command -v docker >/dev/null 2>&1; then
     info "Docker not installed; skipping Docker daemon proxy configuration."
     return
   fi
-
   info "Configuring Docker daemon to use local Xray HTTP proxy..."
   mkdir -p /etc/systemd/system/docker.service.d
-  cat >/etc/systemd/system/docker.service.d/xray-proxy.conf <<'EOF'
+  cat >"$DOCKER_PROXY_FILE" <<'EOF'
 [Service]
 Environment="HTTP_PROXY=http://127.0.0.1:10809"
 Environment="HTTPS_PROXY=http://127.0.0.1:10809"
@@ -390,8 +464,6 @@ EOF
 start_and_test() {
   info "Validating Xray configuration..."
   XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" "$XRAY_BIN" run -test -config "$XRAY_CONFIG"
-
-  systemctl daemon-reload
   systemctl enable --now xray
   sleep 2
   systemctl is-active --quiet xray || {
@@ -401,14 +473,9 @@ start_and_test() {
   }
 
   info "Xray is running."
-  echo
-  echo "Local proxies:"
-  echo "  SOCKS5  socks5h://127.0.0.1:10808"
-  echo "  HTTP    http://127.0.0.1:10809"
-  echo
-  echo "Routing inside Xray:"
-  echo "  Private/CN -> DIRECT"
-  echo "  Everything else -> VLESS"
+  echo "  SOCKS5: socks5h://127.0.0.1:10808"
+  echo "  HTTP:   http://127.0.0.1:10809"
+  echo "  Routing: private/CN -> DIRECT; everything else -> VLESS"
   echo
 
   info "Testing proxy public IP..."
@@ -424,26 +491,27 @@ start_and_test() {
   echo "  Google HTTP status: ${GOOGLE_STATUS:-<failed>}"
 
   if [[ -n "$PROXY_IP" && "$GITHUB_STATUS" =~ ^(200|301|302)$ && "$GOOGLE_STATUS" =~ ^(200|301|302)$ ]]; then
-    echo
     echo "SUCCESS: Xray VLESS path, GitHub and Google access are working."
   else
-    echo
     echo "WARNING: one or more proxy checks failed."
-    echo "Check: journalctl -u xray -n 100 --no-pager"
+    echo "Run: xray-vless-manager test"
   fi
-
-  echo
-  echo "Shell helpers (open a new shell, or run: source /etc/profile.d/xray-proxy.sh):"
-  echo "  proxy_on            enable HTTP(S)/SOCKS proxy vars for current shell"
-  echo "  proxy_off           clear proxy vars for current shell"
-  echo "  xray-proxy-test     quick connectivity test"
-  echo
-  echo "Note: ping uses ICMP and does NOT go through this SOCKS/HTTP proxy."
 }
 
 install_deps
 install_xray
+ensure_service
 make_config
 install_proxy_helpers
+install_management_tools
 start_and_test
 configure_docker_proxy
+
+echo
+echo "Daily commands:"
+echo "  xray-vless-manager status"
+echo "  xray-vless-manager test"
+echo "  proxy_on / proxy_off"
+echo "  sudo xray-vless-manager set-node"
+echo "  sudo xray-vless-manager remove-node"
+echo "  sudo xray-vless-manager uninstall"
