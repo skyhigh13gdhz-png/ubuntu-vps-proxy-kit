@@ -20,9 +20,9 @@ XRAY_ASSET_DIR="/usr/local/share/xray"
 XRAY_TMP_DIR="/tmp/xray-bootstrap"
 XRAY_GITHUB_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
 XRAY_GITHUB_DOWNLOAD_BASE="https://github.com/XTLS/Xray-core/releases/download"
+XRAY_SOURCEFORGE_BASE="https://sourceforge.net/projects/xray-core.mirror/files"
 XRAY_MIRRORS=(
   "https://ghproxy.net/"
-  "https://gh-proxy.com/"
   "https://gh.ddlc.top/"
   "https://gh.llkk.cc/"
 )
@@ -84,22 +84,36 @@ fetch_latest_version() {
   die "Unable to determine latest Xray release."
 }
 
-download_with_fallback() {
-  local url="$1" output="$2" mirror
+download_xray_asset() {
+  local version="$1" asset="$2" output="$3" mirror
+  local github_url="${XRAY_GITHUB_DOWNLOAD_BASE}/${version}/${asset}"
+  local sourceforge_url="${XRAY_SOURCEFORGE_BASE}/${version}/${asset}/download"
 
-  # Mainland VPS: prefer mirrors first. The Xray release asset is much larger
-  # than the GitHub API response, so going straight to a mirror avoids wasting
-  # time on a very slow direct GitHub release download.
+  # Mainland VPS: SourceForge maintains an exact Xray-core mirror and is often
+  # much faster than GitHub release delivery from mainland China.
+  info "Trying SourceForge Xray mirror first..."
+  if curl -fL --retry 0 --connect-timeout 6 --speed-time 10 --speed-limit 102400 --max-time 120 \
+      "$sourceforge_url" -o "$output"; then
+    return 0
+  fi
+  rm -f "$output"
+
+  # Then try GitHub acceleration mirrors. Abort quickly when sustained speed
+  # is below 100 KiB/s so a bad mirror cannot hold the install for minutes.
   for mirror in "${XRAY_MIRRORS[@]}"; do
-    info "Trying GitHub mirror first: $mirror"
-    if curl -fL --retry 1 --connect-timeout 6 --speed-time 10 --speed-limit 51200 --max-time 90 "${mirror}${url}" -o "$output"; then
+    info "Trying GitHub mirror: $mirror"
+    if curl -fL --retry 0 --connect-timeout 6 --speed-time 10 --speed-limit 102400 --max-time 75 \
+        "${mirror}${github_url}" -o "$output"; then
       return 0
     fi
     rm -f "$output"
   done
 
+  # Official GitHub is the final fallback. Keep a lower speed threshold here
+  # so installation can still finish if every mirror is unavailable.
   info "All mirrors failed; falling back to official GitHub..."
-  if curl -fL --retry 1 --connect-timeout 8 --speed-time 15 --speed-limit 20480 --max-time 120 "$url" -o "$output"; then
+  if curl -fL --retry 0 --connect-timeout 8 --speed-time 15 --speed-limit 20480 --max-time 180 \
+      "$github_url" -o "$output"; then
     return 0
   fi
 
@@ -113,17 +127,16 @@ install_xray() {
     return
   fi
 
-  local asset version download_url zip_file
+  local asset version zip_file
   asset="$(get_arch_asset)"
   version="$(fetch_latest_version)"
-  download_url="${XRAY_GITHUB_DOWNLOAD_BASE}/${version}/${asset}"
 
   rm -rf "$XRAY_TMP_DIR"
   mkdir -p "$XRAY_TMP_DIR"
   zip_file="${XRAY_TMP_DIR}/${asset}"
 
   info "Installing Xray ${version} (${asset})..."
-  download_with_fallback "$download_url" "$zip_file" || die "Failed to download Xray from all configured mirrors and GitHub."
+  download_xray_asset "$version" "$asset" "$zip_file" || die "Failed to download Xray from SourceForge, configured mirrors, and GitHub."
 
   unzip -tq "$zip_file" >/dev/null || die "Downloaded Xray archive is corrupt."
   unzip -oq "$zip_file" -d "$XRAY_TMP_DIR"
