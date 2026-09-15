@@ -39,11 +39,63 @@ sudo bash setup-xray-vless.sh 'vless://...'
 
 ```bash
 xray-vless-manager status       # 看当前状态
-xray-vless-manager test         # 检查代理链路
+xray-vless-manager test         # 强制通过 Xray 检查代理链路
 xray-proxy-test                 # 同样的健康检查，可直接调用
-proxy_on                        # 当前 shell 使用本机代理
-proxy_off                       # 当前 shell 取消代理
+proxy_on                        # 让“当前终端”的普通命令自动使用本机 Xray
+proxy_off                       # 取消“当前终端”的自动代理；不会停止 Xray 服务
 ```
+
+### `proxy_on / proxy_off` 到底控制什么？
+
+这两个命令**只控制当前 shell（当前 SSH / 终端会话）的代理环境变量**，不是 Xray 服务的开关。
+
+执行：
+
+```bash
+proxy_on
+```
+
+之后，支持 `HTTP_PROXY / HTTPS_PROXY / ALL_PROXY` 的普通命令会自动把网络请求交给本机 Xray。例如常见的 `curl`、Git 等程序通常可以直接使用这组环境变量。
+
+执行：
+
+```bash
+proxy_off
+```
+
+只是把当前 shell 里的这些代理环境变量取消掉。之后普通命令不会因为这组环境变量而自动进入 Xray。
+
+**但是 Xray 后台服务仍然保持运行，节点也没有被删除。** 所以 `proxy_off` 之后执行：
+
+```bash
+xray-vless-manager test
+```
+
+Google / GitHub 仍然可能显示 200，这是正常的，不代表 `proxy_off` 失效。因为这个健康检查会**主动、强制指定本机 Xray 代理**来验证链路，本来就不依赖 `proxy_on / proxy_off`。
+
+可以把三者理解成：
+
+```text
+proxy_on / proxy_off       当前终端的普通命令要不要“自动使用”Xray
+Xray service               后台代理服务本身是否运行
+xray-vless-manager test    无论当前终端开关如何，都“强制走 Xray”检查代理是否健康
+```
+
+如果你的目标是**停止 Xray / 移除节点**，不要使用 `proxy_off`，而是：
+
+```bash
+sudo xray-vless-manager remove-node
+```
+
+如果只是想确认当前 shell 有没有开启自动代理，可以执行：
+
+```bash
+env | grep -i proxy
+```
+
+新版 `xray-vless-manager test` 也会直接显示 `Shell auto-proxy: ON/OFF`，并明确说明后面的 Google / GitHub 测试是强制通过 Xray 完成的。
+
+> `proxy_on / proxy_off` 只影响执行它们的当前 shell，不会自动改变其他已经打开的 SSH 会话、终端窗口或其他服务进程的环境变量。
 
 如果刚安装完当前 shell 还找不到 `proxy_on`：
 
@@ -99,16 +151,7 @@ xray_return_cleanup
 4. 执行完整卸载。
 5. 扫描常见用户的 `.bash_history` / `.zsh_history` / `.sh_history` / `.ash_history`，删除包含 `vless://` 的历史行。
 
-完整卸载会删除：
-
-- 当前 VLESS 节点配置及旧备份
-- Xray systemd 服务
-- Xray 二进制和地域数据
-- `proxy_on / proxy_off`
-- `xray-proxy-test`
-- `xray-vless-manager`
-- Docker daemon 的 Xray 代理配置
-- 本机保存的安装脚本副本
+完整卸载会删除当前 VLESS 节点配置及旧备份、Xray systemd 服务、Xray 二进制和地域数据、`proxy_on / proxy_off`、`xray-proxy-test`、`xray-vless-manager`、Docker daemon 的 Xray 代理配置，以及本机保存的安装脚本副本。
 
 如果不方便调用 shell function，也可以：
 
@@ -126,9 +169,7 @@ sudo xray-vless-manager purge-history
 
 ### 一个重要边界
 
-历史清理针对常见 shell history 和本项目的配置文件。
-
-如果过去曾把 VLESS 链接直接放进命令行参数，系统级 sudo/audit/journal、终端录屏、第三方运维平台日志等位置理论上仍可能留痕。本脚本不会为了清一条凭据而粗暴删除整台服务器的系统审计日志。
+历史清理针对常见 shell history 和本项目的配置文件。如果过去曾把 VLESS 链接直接放进命令行参数，系统级 sudo/audit/journal、终端录屏、第三方运维平台日志等位置理论上仍可能留痕。本脚本不会为了清一条凭据而粗暴删除整台服务器的系统审计日志。
 
 因此最安全的长期规则是：**从现在开始只使用隐藏输入；服务器退役时同时在节点服务端撤销/更换旧凭据。**
 
@@ -156,13 +197,7 @@ sudo xray-vless-manager purge-history
 
 ## 不要用 ping 判断代理
 
-```bash
-ping google.com
-```
-
-使用的是 ICMP，不会进入当前 HTTP / SOCKS 代理。
-
-判断是否正常直接运行：
+`ping google.com` 使用的是 ICMP，不会进入当前 HTTP / SOCKS 代理。判断是否正常直接运行：
 
 ```bash
 xray-vless-manager test
@@ -172,15 +207,7 @@ xray-vless-manager test
 
 在腾讯云国内 VPS 上已经实际验证：Xray 正常启动、GitHub 和 Google 可以经海外节点访问、Gitee 国内镜像可高速获取 Xray 安装包、本地 SOCKS5 / HTTP 链路正常。
 
-Xray 二进制优先来自：
-
-```text
-https://gitee.com/skyhigh13/xray_bin.git
-```
-
-当前默认版本：`v26.3.27`。
-
-支持常见 VPS 架构：`x86_64 / amd64`、`arm64 / aarch64`、`armv7`。
+Xray 二进制优先来自 `https://gitee.com/skyhigh13/xray_bin.git`。当前默认版本：`v26.3.27`。支持常见 VPS 架构：`x86_64 / amd64`、`arm64 / aarch64`、`armv7`。
 
 ---
 
@@ -230,11 +257,7 @@ curl -I -x http://127.0.0.1:10809 https://github.com
 /etc/systemd/system/xray.service
 ```
 
-Docker 已安装时还有：
-
-```text
-/etc/systemd/system/docker.service.d/xray-proxy.conf
-```
+Docker 已安装时还有 `/etc/systemd/system/docker.service.d/xray-proxy.conf`。
 
 ## Xray 下载策略
 
