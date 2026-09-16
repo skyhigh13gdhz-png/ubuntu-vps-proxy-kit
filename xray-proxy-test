@@ -5,18 +5,8 @@ SOCKS="127.0.0.1:10808"
 HTTP="http://127.0.0.1:10809"
 FAILED=0
 
-shell_proxy_state() {
-  local value
-  for value in "${http_proxy:-}" "${https_proxy:-}" "${HTTP_PROXY:-}" "${HTTPS_PROXY:-}" "${ALL_PROXY:-}" "${all_proxy:-}"; do
-    case "$value" in
-      *127.0.0.1:10808*|*127.0.0.1:10809*)
-        echo "ON"
-        return
-        ;;
-    esac
-  done
-  echo "OFF"
-}
+ok(){ printf '[✓] %s\n' "$*"; }
+fail(){ printf '[✗] %s\n' "$*"; FAILED=1; }
 
 check_http() {
   local label="$1" mode="$2" url="$3" status
@@ -25,51 +15,23 @@ check_http() {
   else
     status="$(curl -o /dev/null -sS -w '%{http_code}' --max-time 20 -x "$HTTP" "$url" 2>/dev/null || true)"
   fi
-
-  if [[ "$status" =~ ^(200|204|301|302|307|308)$ ]]; then
-    printf '%-23s OK (%s)\n' "$label:" "$status"
-  else
-    printf '%-23s FAILED (%s)\n' "$label:" "${status:-no response}"
-    FAILED=1
-  fi
+  if [[ "$status" =~ ^(200|204|301|302|307|308|401)$ ]]; then ok "$label：可访问（HTTP $status）"; else fail "$label：访问失败（${status:-无响应}）"; fi
 }
 
-SHELL_PROXY="$(shell_proxy_state)"
-printf '%-23s %s\n' "Shell auto-proxy:" "$SHELL_PROXY"
-
-if systemctl is-active --quiet xray 2>/dev/null; then
-  printf '%-23s OK\n' "Xray service:"
-else
-  printf '%-23s FAILED\n' "Xray service:"
-  FAILED=1
-fi
-
-echo
-echo "Xray path check (forced through local proxy; independent of proxy_on/proxy_off):"
-check_http "Google via Xray" socks "https://www.google.com/"
-check_http "GitHub via Xray" http "https://github.com/"
+echo '========== 海外网络检查 =========='
+if systemctl is-active --quiet xray 2>/dev/null; then ok 'Xray 服务：正常'; else fail 'Xray 服务：异常'; fi
+check_http 'Google' socks 'https://www.google.com/'
+check_http 'GitHub' http 'https://github.com/'
+check_http 'Docker Registry' http 'https://registry-1.docker.io/v2/'
 
 PROXY_IP="$(curl -4fsS --max-time 20 --socks5-hostname "$SOCKS" https://api.ipify.org 2>/dev/null || true)"
-if [[ -n "$PROXY_IP" ]]; then
-  printf '%-23s %s\n' "Xray exit IP:" "$PROXY_IP"
-else
-  printf '%-23s FAILED\n' "Xray exit IP:"
-  FAILED=1
-fi
+if [[ -n "$PROXY_IP" ]]; then ok "海外出口：已生效（${PROXY_IP}）"; else fail '海外出口：无法确认'; fi
 
 echo
-if [[ "$SHELL_PROXY" == "ON" ]]; then
-  echo "Shell meaning: ordinary commands in THIS shell can automatically use Xray."
-else
-  echo "Shell meaning: ordinary commands in THIS shell are NOT automatically using Xray."
-fi
-echo "Note: the Xray checks above explicitly select the local proxy, so they can succeed even when Shell auto-proxy is OFF."
-
 if [[ "$FAILED" -eq 0 ]]; then
-  echo "RESULT: Xray proxy path is healthy."
+  ok '海外网络配置完成'
 else
-  echo "RESULT: one or more Xray path checks failed."
-  echo "Logs: journalctl -u xray -n 100 --no-pager"
+  fail '海外网络配置未通过，请先处理上面的失败项'
+  echo '[→] 排障日志：sudo journalctl -u xray -n 50 --no-pager'
 fi
-
 exit "$FAILED"
